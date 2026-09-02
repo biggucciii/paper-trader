@@ -221,6 +221,7 @@ function mapPair(p) {
 const GRAD_SOL_RAISE = 85;
 const TEN_MIN_MS = 10 * 60 * 1000;
 const ONE_HOUR_MS = 60 * 60 * 1000;
+const NEW_PAIR_WINDOW_MS = 6 * 60 * 60 * 1000; // realistic window given free-API freshness limits
 // Pump.fun charges ~1% on bonding-curve trades. Exact cumulative fee totals
 // aren't exposed by the free DexScreener API, so we approximate fees paid
 // from trading volume. Flagged as an approximation everywhere it's shown.
@@ -264,13 +265,15 @@ async function fetchLiveSolPairs(query) {
    batched call.
 ------------------------------------------------------------- */
 async function fetchDiscoveryUniverse() {
-  const [boostsRes, profilesRes] = await Promise.allSettled([
+  const [topBoostsRes, latestBoostsRes, profilesRes] = await Promise.allSettled([
     fetch(`${DS_BASE}/token-boosts/top/v1`).then((r) => r.json()),
+    fetch(`${DS_BASE}/token-boosts/latest/v1`).then((r) => r.json()),
     fetch(`${DS_BASE}/token-profiles/latest/v1`).then((r) => r.json()),
   ]);
-  const boosts = boostsRes.status === "fulfilled" && Array.isArray(boostsRes.value) ? boostsRes.value : [];
+  const topBoosts = topBoostsRes.status === "fulfilled" && Array.isArray(topBoostsRes.value) ? topBoostsRes.value : [];
+  const latestBoosts = latestBoostsRes.status === "fulfilled" && Array.isArray(latestBoostsRes.value) ? latestBoostsRes.value : [];
   const profiles = profilesRes.status === "fulfilled" && Array.isArray(profilesRes.value) ? profilesRes.value : [];
-  const combined = [...boosts, ...profiles].filter((e) => e.chainId === "solana" && e.tokenAddress);
+  const combined = [...latestBoosts, ...topBoosts, ...profiles].filter((e) => e.chainId === "solana" && e.tokenAddress);
 
   const iconByAddress = {};
   const addresses = [];
@@ -332,6 +335,37 @@ async function fetchWalletActivity(address, limit = 8) {
   const json = await res.json();
   if (json.error) throw new Error(json.error.message || "rpc error");
   return json.result || [];
+}
+
+/* ------------------------------------------------------------
+   Contract safety — reads the token mint account directly from
+   Solana's public RPC using jsonParsed encoding, so the RPC does
+   the SPL Token layout decoding, not us (hand-decoding raw bytes
+   would risk getting offsets wrong and silently showing garbage).
+   Tells you whether mint/freeze authority have been revoked —
+   real on-chain facts, the same signal every terminal shows.
+------------------------------------------------------------- */
+async function fetchMintSafety(mintAddress) {
+  const res = await fetch(SOLANA_RPC, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      jsonrpc: "2.0",
+      id: 1,
+      method: "getAccountInfo",
+      params: [mintAddress, { encoding: "jsonParsed" }],
+    }),
+  });
+  if (!res.ok) throw new Error("rpc request failed");
+  const json = await res.json();
+  const info = json?.result?.value?.data?.parsed?.info;
+  if (!info) throw new Error("no parsed mint info returned");
+  return {
+    mintAuthority: info.mintAuthority || null,
+    freezeAuthority: info.freezeAuthority || null,
+    supply: info.supply,
+    decimals: info.decimals,
+  };
 }
 
 /* ------------------------------------------------------------
@@ -719,7 +753,7 @@ const LIQ_FILTERS = [
   { label: "$100K+ Liq", min: 100000 },
 ];
 
-function DiscoverScreen({ tokens, loading, dataMode, onOpen, watchlist, onToggleWatch, query, setQuery, solPrice }) {
+function DiscoverScreen({ tokens, loading, dataMode, onOpen, watchlist, onToggleWatch, query, setQuery, solPrice, compact }) {
   const [tab, setTab] = useState("Trending");
   const [minLiq, setMinLiq] = useState(0);
 
@@ -752,11 +786,13 @@ function DiscoverScreen({ tokens, loading, dataMode, onOpen, watchlist, onToggle
           <div style={{ fontSize: 20, fontWeight: 800, letterSpacing: -0.3 }}>Discover</div>
           <LiveBadge dataMode={dataMode} />
         </div>
-        <div style={{ display: "flex", gap: 14, marginBottom: 12, fontFamily: "'JetBrains Mono', monospace", fontSize: 11, color: C.faint }}>
-          <span>SOL <span style={{ color: C.text, fontWeight: 600 }}>${solPrice.toFixed(2)}</span></span>
-          <span>{tokens.length} tracked</span>
+        {!compact && (
+          <div style={{ display: "flex", gap: 14, marginBottom: 12, fontFamily: "'JetBrains Mono', monospace", fontSize: 11, color: C.faint }}>
+            <span>SOL <span style={{ color: C.text, fontWeight: 600 }}>${solPrice.toFixed(2)}</span></span>
+            <span>{tokens.length} tracked</span>
           <span>{fmtUsd(totalVol)} 24h vol</span>
-        </div>
+          </div>
+        )}
         <div
           style={{
             display: "flex", alignItems: "center", gap: 8, background: C.panel,
@@ -862,7 +898,7 @@ function MemescopeScreen({ tokens, dataMode, onOpen, watchlist, onToggleWatch, s
   let list;
   if (tab === "new") {
     list = withMeta
-      .filter((t) => t._stage !== "graduated" && t._ageMs !== null && t._ageMs <= TEN_MIN_MS)
+      .filter((t) => t._stage !== "graduated" && t._ageMs !== null && t._ageMs <= NEW_PAIR_WINDOW_MS)
       .sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
   } else if (tab === "graduating") {
     list = withMeta
@@ -876,7 +912,7 @@ function MemescopeScreen({ tokens, dataMode, onOpen, watchlist, onToggleWatch, s
 
   const threshold = gradMarketCapUsd(solPrice);
   const tabDef = {
-    new: "Bonding-curve pairs created in the last 10 minutes.",
+    new: "Newest bonding-curve pairs in the current feed (last 6 hours). Truly sub-10-minute listings aren't available — pump.fun's own API blocks direct browser access.",
     graduating: `Under 1 hour old, $10K+ market cap, 0.5+ SOL in fees — closing in on ${fmtUsd(threshold)} to migrate.`,
     graduated: "Already bonded — $10K+ market cap, 1+ SOL in lifetime fees.",
   }[tab];
@@ -1023,6 +1059,73 @@ function Candle(props) {
   );
 }
 
+function ContractSafetyPanel({ tokenAddress, simulated }) {
+  const [state, setState] = useState({ status: "loading", data: null });
+
+  useEffect(() => {
+    if (simulated || !tokenAddress) {
+      setState({ status: "unavailable", data: null });
+      return;
+    }
+    let cancelled = false;
+    setState({ status: "loading", data: null });
+    (async () => {
+      try {
+        const data = await fetchMintSafety(tokenAddress);
+        if (!cancelled) setState({ status: "ok", data });
+      } catch {
+        if (!cancelled) setState({ status: "error", data: null });
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [tokenAddress, simulated]);
+
+  const wrap = (children) => (
+    <div style={{ margin: "0 14px 14px", background: `linear-gradient(155deg, ${C.panel}, ${C.panel2})`, border: `1px solid ${C.borderSoft}`, borderRadius: 14, padding: 14, boxShadow: "0 1px 0 rgba(255,255,255,0.025) inset, 0 6px 16px rgba(0,0,0,0.18)" }}>
+      <div style={{ fontSize: 11, fontWeight: 700, color: C.amber, textTransform: "uppercase", letterSpacing: 0.8, marginBottom: 10 }}>
+        Contract Safety
+      </div>
+      {children}
+    </div>
+  );
+
+  if (state.status === "loading") return wrap(<div style={{ fontSize: 12, color: C.faint }}>Checking mint on-chain...</div>);
+  if (state.status !== "ok") {
+    return wrap(
+      <div style={{ fontSize: 12, color: C.faint }}>
+        {simulated ? "Not available for simulated tokens." : "Couldn't reach Solana RPC to check this contract right now."}
+      </div>
+    );
+  }
+
+  const { mintAuthority, freezeAuthority } = state.data;
+  const mintRevoked = !mintAuthority;
+  const freezeRevoked = !freezeAuthority;
+  const Row = ({ label, revoked, tip }) => (
+    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
+      <Tooltip term={label} def={tip}><span style={{ fontSize: 13, color: C.sub }}>{label}</span></Tooltip>
+      <span style={{ fontSize: 12.5, fontWeight: 700, color: revoked ? C.buy : C.sell, display: "flex", alignItems: "center", gap: 4 }}>
+        {revoked ? <Check size={13} /> : <CircleAlert size={13} />} {revoked ? "Revoked" : "Active"}
+      </span>
+    </div>
+  );
+
+  return wrap(
+    <>
+      <Row
+        label="Mint Authority"
+        revoked={mintRevoked}
+        tip="Whether the creator can still mint (create) more supply out of thin air. Revoked is safer — total supply can never be inflated after the fact."
+      />
+      <Row
+        label="Freeze Authority"
+        revoked={freezeRevoked}
+        tip="Whether the creator can freeze specific wallets, blocking them from trading. Revoked is safer — no one can be locked out after buying in."
+      />
+    </>
+  );
+}
+
 /* ============================================================
    TOKEN DETAIL / TRADE SCREEN
 ============================================================ */
@@ -1032,6 +1135,8 @@ function TokenScreen({ token, portfolio, setPortfolio, onBack, watched, onToggle
   const [sellPct, setSellPct] = useState(null);
   const [toast, setToast] = useState(null);
   const [confirming, setConfirming] = useState(false);
+  const [tpInput, setTpInput] = useState("");
+  const [slInput, setSlInput] = useState("");
 
   const holding = portfolio.holdings[token.address];
   const beginnerMode = portfolio.beginnerMode;
@@ -1107,6 +1212,26 @@ function TokenScreen({ token, portfolio, setPortfolio, onBack, watched, onToggle
   }
 
   const quickBuys = [0.1, 0.5, 1, 2, 5];
+
+  useEffect(() => {
+    setTpInput(holding?.tpPct != null ? String(holding.tpPct) : "");
+    setSlInput(holding?.slPct != null ? String(holding.slPct) : "");
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [token.address]);
+
+  function saveAutoOrders() {
+    const tp = tpInput === "" ? null : Math.abs(parseFloat(tpInput)) || null;
+    const sl = slInput === "" ? null : Math.abs(parseFloat(slInput)) || null;
+    setPortfolio((p) => {
+      const h = p.holdings[token.address];
+      if (!h) return p;
+      return { ...p, holdings: { ...p.holdings, [token.address]: { ...h, tpPct: tp, slPct: sl } } };
+    });
+    flashToast(
+      tp || sl ? `Auto-sell set: ${tp ? `+${tp}% TP` : ""}${tp && sl ? " / " : ""}${sl ? `-${sl}% SL` : ""}` : "Auto-sell orders cleared",
+      "buy"
+    );
+  }
 
   return (
     <div style={{ paddingBottom: isDesktop ? 24 : 100 }}>
@@ -1188,6 +1313,8 @@ function TokenScreen({ token, portfolio, setPortfolio, onBack, watched, onToggle
         </div>
       )}
 
+      <ContractSafetyPanel tokenAddress={token.address} simulated={token.simulated} />
+
       {posAmount > 0 && (
         <div style={{ margin: "0 14px 14px", background: `linear-gradient(155deg, ${C.panel}, ${C.panel2})`, border: `1px solid ${C.borderSoft}`, boxShadow: "0 1px 0 rgba(255,255,255,0.025) inset, 0 6px 16px rgba(0,0,0,0.18)", borderRadius: 14, padding: 14 }}>
           <div style={{ fontSize: 12, color: C.faint, marginBottom: 8 }}>Your position</div>
@@ -1204,6 +1331,42 @@ function TokenScreen({ token, portfolio, setPortfolio, onBack, watched, onToggle
             <Pill positive={unrealizedPnl >= 0}>
               {unrealizedPnl >= 0 ? "+" : ""}${unrealizedPnl.toFixed(2)} ({pct(unrealizedPct)})
             </Pill>
+          </div>
+
+          <div style={{ marginTop: 12, paddingTop: 12, borderTop: `1px solid ${C.borderSoft}` }}>
+            <Tooltip term="Take-Profit / Stop-Loss" def="Set a target gain or loss percentage once, and the app auto-sells the whole position for you the moment it's hit — even if you're not watching this token.">
+              <div style={{ fontSize: 11, color: C.faint, marginBottom: 8 }}>Auto-sell (TP / SL)</div>
+            </Tooltip>
+            <div style={{ display: "flex", gap: 6, marginBottom: 8 }}>
+              <div style={{ flex: 1, display: "flex", alignItems: "center", background: C.panel2, border: `1px solid ${C.border}`, borderRadius: 9, padding: "6px 9px" }}>
+                <span style={{ color: C.buy, fontSize: 12, marginRight: 4 }}>+</span>
+                <input
+                  value={tpInput}
+                  onChange={(e) => setTpInput(e.target.value.replace(/[^0-9.]/g, ""))}
+                  placeholder="TP %"
+                  style={{ width: "100%", background: "transparent", border: "none", outline: "none", color: C.text, fontSize: 12.5, fontFamily: "'JetBrains Mono', monospace" }}
+                />
+              </div>
+              <div style={{ flex: 1, display: "flex", alignItems: "center", background: C.panel2, border: `1px solid ${C.border}`, borderRadius: 9, padding: "6px 9px" }}>
+                <span style={{ color: C.sell, fontSize: 12, marginRight: 4 }}>-</span>
+                <input
+                  value={slInput}
+                  onChange={(e) => setSlInput(e.target.value.replace(/[^0-9.]/g, ""))}
+                  placeholder="SL %"
+                  style={{ width: "100%", background: "transparent", border: "none", outline: "none", color: C.text, fontSize: 12.5, fontFamily: "'JetBrains Mono', monospace" }}
+                />
+              </div>
+              <button onClick={saveAutoOrders} style={{ padding: "0 14px", borderRadius: 9, border: "none", background: C.amber, color: "#0A0A0C", fontWeight: 700, fontSize: 12, cursor: "pointer" }}>
+                Set
+              </button>
+            </div>
+            {(holding.tpPct || holding.slPct) && (
+              <div style={{ fontSize: 11, color: C.faint }}>
+                Active: {holding.tpPct ? <span style={{ color: C.buy }}>+{holding.tpPct}% TP</span> : null}
+                {holding.tpPct && holding.slPct ? " · " : ""}
+                {holding.slPct ? <span style={{ color: C.sell }}>-{holding.slPct}% SL</span> : null}
+              </div>
+            )}
           </div>
         </div>
       )}
@@ -1439,7 +1602,14 @@ function PortfolioScreen({ portfolio, tokenMap, solPrice, onOpenToken }) {
               <Avatar t={tokenMap[t.address] || { symbol: t.symbol }} size={26} radius={7} fontSize={9.5} />
               {t.type === "buy" ? <ArrowUpRight size={13} color={C.buy} style={{ marginLeft: 6, flexShrink: 0 }} /> : <ArrowDownRight size={13} color={C.sell} style={{ marginLeft: 6, flexShrink: 0 }} />}
               <div style={{ flex: 1, marginLeft: 10 }}>
-                <div style={{ fontSize: 13.5, fontWeight: 600 }}>{t.type === "buy" ? "Bought" : "Sold"} {t.symbol}</div>
+                <div style={{ fontSize: 13.5, fontWeight: 600 }}>
+                  {t.type === "buy" ? "Bought" : "Sold"} {t.symbol}
+                  {t.auto && (
+                    <span style={{ marginLeft: 6, fontSize: 9.5, fontWeight: 700, color: t.auto === "tp" ? C.buy : C.sell, background: t.auto === "tp" ? C.buyDim : C.sellDim, borderRadius: 5, padding: "2px 5px" }}>
+                      AUTO {t.auto.toUpperCase()}
+                    </span>
+                  )}
+                </div>
                 <div style={{ fontSize: 11, color: C.faint }}>{new Date(t.time).toLocaleString()}</div>
               </div>
               <div style={{ textAlign: "right" }}>
@@ -1706,6 +1876,50 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tokens]);
 
+  // TP/SL automation — runs on every price refresh, closes any position
+  // that's crossed its set target, even if you're not viewing that token.
+  useEffect(() => {
+    if (!ready || !portfolio) return;
+    const toClose = [];
+    for (const [address, h] of Object.entries(portfolio.holdings)) {
+      if (!h.tpPct && !h.slPct) continue;
+      const live = tokenMap[address];
+      if (!live || !live.priceUsd || !h.avgEntry) continue;
+      const pnlPct = ((live.priceUsd - h.avgEntry) / h.avgEntry) * 100;
+      if (h.tpPct && pnlPct >= h.tpPct) toClose.push({ address, reason: "tp", price: live.priceUsd });
+      else if (h.slPct && pnlPct <= -h.slPct) toClose.push({ address, reason: "sl", price: live.priceUsd });
+    }
+    if (toClose.length === 0) return;
+    setPortfolio((p) => {
+      const nextHoldings = { ...p.holdings };
+      const newTrades = [];
+      let realizedDelta = 0;
+      let balanceDelta = 0;
+      for (const { address, reason, price } of toClose) {
+        const h = nextHoldings[address];
+        if (!h) continue;
+        const usdReceived = h.amount * price;
+        const solReceived = usdReceived / solPrice;
+        const realized = usdReceived - h.amount * h.avgEntry;
+        realizedDelta += realized;
+        balanceDelta += solReceived;
+        delete nextHoldings[address];
+        newTrades.push({
+          id: uid(), type: "sell", symbol: h.symbol, address, solAmount: solReceived,
+          priceUsd: price, tokenAmount: h.amount, realizedUsd: realized, time: Date.now(), auto: reason,
+        });
+      }
+      return {
+        ...p,
+        holdings: nextHoldings,
+        balance: +(p.balance + balanceDelta).toFixed(6),
+        realizedPnl: p.realizedPnl + realizedDelta,
+        trades: [...newTrades, ...p.trades],
+      };
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tokens]);
+
   function toggleWatch(t) {
     setPortfolio((p) => {
       const has = p.watchlist.includes(t.address);
@@ -1734,7 +1948,7 @@ export default function App() {
       style={{
         background: `radial-gradient(ellipse 900px 500px at 50% -10%, ${C.panel3}55, ${C.bg} 60%)`,
         minHeight: "100%",
-        maxWidth: isDesktop ? 1200 : 480, margin: "0 auto",
+        maxWidth: isDesktop ? 1400 : 480, margin: "0 auto",
         paddingLeft: isDesktop ? 220 : 0,
         fontFamily: "'Inter', sans-serif", color: C.text, position: "relative",
       }}
@@ -1748,7 +1962,7 @@ export default function App() {
         .spin { animation: spin 1s linear infinite; }
       `}</style>
 
-      {selected ? (
+      {!isDesktop && selected ? (
         <TokenScreen
           token={selected}
           portfolio={portfolio}
@@ -1757,50 +1971,80 @@ export default function App() {
           watched={portfolio.watchlist.includes(selected.address)}
           onToggleWatch={toggleWatch}
           solPrice={solPrice}
-          isDesktop={isDesktop}
+          isDesktop={false}
         />
       ) : (
         <>
-          <div style={isDesktop ? { maxWidth: 760, margin: "0 auto" } : undefined}>
-            {tab === "discover" && (
-              <DiscoverScreen
-                tokens={tokens}
-                loading={loading}
-                dataMode={dataMode}
-                onOpen={setSelected}
-                watchlist={portfolio.watchlist}
-                onToggleWatch={toggleWatch}
-                query={query}
-                setQuery={setQuery}
-                solPrice={solPrice}
-              />
-            )}
-            {tab === "memescope" && (
-              <MemescopeScreen
-                tokens={tokens}
-                dataMode={dataMode}
-                onOpen={setSelected}
-                watchlist={portfolio.watchlist}
-                onToggleWatch={toggleWatch}
-                solPrice={solPrice}
-              />
-            )}
-            {tab === "wallets" && <WalletsScreen />}
-            {tab === "portfolio" && (
-              <PortfolioScreen portfolio={portfolio} tokenMap={tokenMap} solPrice={solPrice} onOpenToken={setSelected} />
-            )}
-            {tab === "learn" && (
-              <LearnScreen
-                beginnerMode={portfolio.beginnerMode}
-                setBeginnerMode={(v) => setPortfolio((p) => ({ ...p, beginnerMode: v }))}
-              />
+          {/* Desktop: browsing + a selected token render side by side, terminal-style —
+              no full navigation away from the list. Mobile keeps the full-screen
+              takeover above, since there isn't room for both at once. */}
+          <div style={{ display: isDesktop ? "flex" : "block", gap: 20, alignItems: "flex-start" }}>
+            <div
+              style={
+                isDesktop
+                  ? {
+                      flex: selected ? "0 0 340px" : "1 1 auto", minWidth: 0,
+                      maxWidth: selected ? 340 : 760, margin: selected ? 0 : "0 auto",
+                    }
+                  : undefined
+              }
+            >
+              {tab === "discover" && (
+                <DiscoverScreen
+                  tokens={tokens}
+                  loading={loading}
+                  dataMode={dataMode}
+                  onOpen={setSelected}
+                  watchlist={portfolio.watchlist}
+                  onToggleWatch={toggleWatch}
+                  query={query}
+                  setQuery={setQuery}
+                  solPrice={solPrice}
+                  compact={isDesktop && !!selected}
+                />
+              )}
+              {tab === "memescope" && (
+                <MemescopeScreen
+                  tokens={tokens}
+                  dataMode={dataMode}
+                  onOpen={setSelected}
+                  watchlist={portfolio.watchlist}
+                  onToggleWatch={toggleWatch}
+                  solPrice={solPrice}
+                />
+              )}
+              {tab === "wallets" && <WalletsScreen />}
+              {tab === "portfolio" && (
+                <PortfolioScreen portfolio={portfolio} tokenMap={tokenMap} solPrice={solPrice} onOpenToken={setSelected} />
+              )}
+              {tab === "learn" && (
+                <LearnScreen
+                  beginnerMode={portfolio.beginnerMode}
+                  setBeginnerMode={(v) => setPortfolio((p) => ({ ...p, beginnerMode: v }))}
+                />
+              )}
+            </div>
+
+            {isDesktop && selected && (
+              <div style={{ flex: "1 1 0%", minWidth: 0 }}>
+                <TokenScreen
+                  token={selected}
+                  portfolio={portfolio}
+                  setPortfolio={setPortfolio}
+                  onBack={() => setSelected(null)}
+                  watched={portfolio.watchlist.includes(selected.address)}
+                  onToggleWatch={toggleWatch}
+                  solPrice={solPrice}
+                  isDesktop={true}
+                />
+              </div>
             )}
           </div>
 
           {isDesktop ? (
             <div
               style={{
-                position: "fixed", top: 0, left: "max(0px, calc(50% - 600px))", bottom: 0, width: 220,
+                position: "fixed", top: 0, left: "max(0px, calc(50% - 700px))", bottom: 0, width: 220,
                 display: "flex", flexDirection: "column", gap: 4, background: C.panel,
                 borderRight: `1px solid ${C.border}`, padding: "20px 12px",
               }}
@@ -1814,7 +2058,7 @@ export default function App() {
                 return (
                   <div
                     key={n.id}
-                    onClick={() => setTab(n.id)}
+                    onClick={() => { setTab(n.id); setSelected(null); }}
                     style={{
                       display: "flex", alignItems: "center", gap: 10, padding: "10px 12px", borderRadius: 10,
                       cursor: "pointer", background: active ? C.amberDim : "transparent",
