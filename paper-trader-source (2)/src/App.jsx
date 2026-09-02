@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from "react";
-import { AreaChart, Area, XAxis, YAxis, ResponsiveContainer } from "recharts";
+import { ComposedChart, Bar, XAxis, YAxis, ResponsiveContainer } from "recharts";
 import {
   Search, Star, ArrowUpRight, ArrowDownRight, ChevronLeft, X, Info,
   TrendingUp, TrendingDown, Flame, Clock, BarChart3, Wallet, GraduationCap,
@@ -13,20 +13,23 @@ import {
    align like a real ticker.
 ============================================================ */
 const C = {
-  bg: "#0A0A0C",
-  panel: "#131417",
-  panel2: "#1B1D22",
-  border: "#26282F",
-  borderSoft: "#1E2025",
-  text: "#F1F1EF",
-  sub: "#8C8E96",
-  faint: "#5B5D66",
+  bg: "#08090B",
+  panel: "#111318",
+  panel2: "#181A20",
+  panel3: "#20232B",
+  border: "#282B33",
+  borderSoft: "#1C1E24",
+  borderStrong: "#363A44",
+  text: "#F3F3F1",
+  sub: "#94969F",
+  faint: "#5C5E67",
   amber: "#F0A93E",
   amberDim: "#3A2E17",
+  amberGlow: "rgba(240,169,62,0.12)",
   buy: "#3ECF7E",
-  buyDim: "#173226",
+  buyDim: "#15291F",
   sell: "#F5525B",
-  sellDim: "#341A1C",
+  sellDim: "#2E1518",
 };
 
 const FONT_CSS = `
@@ -80,6 +83,16 @@ function timeAgo(ms) {
   if (h < 24) return `${h}h ago`;
   return `${Math.floor(h / 24)}d ago`;
 }
+function useIsDesktop() {
+  const [isDesktop, setIsDesktop] = useState(() => typeof window !== "undefined" && window.innerWidth >= 900);
+  useEffect(() => {
+    const mq = window.matchMedia("(min-width: 900px)");
+    const handler = (e) => setIsDesktop(e.matches);
+    mq.addEventListener("change", handler);
+    return () => mq.removeEventListener("change", handler);
+  }, []);
+  return isDesktop;
+}
 
 /* ============================================================
    DATA LAYER — DexScreener public API, with simulated fallback
@@ -113,6 +126,10 @@ function seedSimTokens() {
         ? Math.random() * ONE_HOUR_MS
         : Math.random() * 1000 * 60 * 60 * 24 * 20;
     const feesSol = group === "new" ? Math.random() * 0.3 : group === "graduating" ? 0.5 + Math.random() * 2 : 1 + Math.random() * 7;
+    const volume24h = Math.random() * 4_000_000;
+    const mc = stage === "bonding" ? (bondingPctVal / 100) * threshold : Math.random() * 12_000_000 + 100_000;
+    const buys24h = Math.floor(Math.random() * 900) + 20;
+    const sellRatio = 0.3 + Math.random() * 0.5;
     return {
       address: "SIM" + uid() + i,
       pairAddress: "SIM" + uid(),
@@ -120,11 +137,19 @@ function seedSimTokens() {
       name,
       image: null,
       priceUsd: price || 0.0000123,
+      change5m: (Math.random() - 0.5) * 6,
       change1h: (Math.random() - 0.5) * 20,
+      change6h: (Math.random() - 0.5) * 40,
       change24h: (Math.random() - 0.45) * 80,
-      volume24h: Math.random() * 4_000_000,
+      volume24h,
+      volume1h: volume24h * (0.02 + Math.random() * 0.08),
       liquidity: Math.random() * 900_000 + 20_000,
-      marketCap: stage === "bonding" ? (bondingPctVal / 100) * threshold : Math.random() * 12_000_000 + 100_000,
+      marketCap: mc,
+      fdv: mc * (1 + Math.random() * 0.15),
+      buys24h,
+      sells24h: Math.floor(buys24h * sellRatio),
+      buys1h: Math.floor(buys24h * 0.05),
+      sells1h: Math.floor(buys24h * sellRatio * 0.05),
       createdAt: Date.now() - ageMs,
       stage,
       bondingPctVal,
@@ -144,10 +169,14 @@ function jitterSimTokens(tokens) {
     return {
       ...t,
       priceUsd: newPrice,
+      change5m: t.change5m + (Math.random() - 0.5) * 1,
       change1h: t.change1h + (Math.random() - 0.5) * 2,
+      change6h: t.change6h + (Math.random() - 0.5) * 3,
       change24h: t.change24h + delta24,
       bondingPctVal: newBonding,
       feesSol: t.feesSol + Math.random() * 0.02,
+      buys24h: t.buys24h + Math.floor(Math.random() * 4),
+      sells24h: t.sells24h + Math.floor(Math.random() * 3),
       stage: newBonding >= 100 ? "graduated" : t.stage,
     };
   });
@@ -160,11 +189,19 @@ function mapPair(p) {
     symbol: p.baseToken?.symbol,
     name: p.baseToken?.name,
     priceUsd: parseFloat(p.priceUsd) || 0,
+    change5m: p.priceChange?.m5 ?? 0,
     change1h: p.priceChange?.h1 ?? 0,
+    change6h: p.priceChange?.h6 ?? 0,
     change24h: p.priceChange?.h24 ?? 0,
     volume24h: p.volume?.h24 ?? 0,
+    volume1h: p.volume?.h1 ?? 0,
     liquidity: p.liquidity?.usd ?? 0,
     marketCap: p.marketCap ?? p.fdv ?? 0,
+    fdv: p.fdv ?? p.marketCap ?? 0,
+    buys24h: p.txns?.h24?.buys ?? 0,
+    sells24h: p.txns?.h24?.sells ?? 0,
+    buys1h: p.txns?.h1?.buys ?? 0,
+    sells1h: p.txns?.h1?.sells ?? 0,
     createdAt: p.pairCreatedAt ?? null,
     dexId: p.dexId ?? null,
     image: p.info?.imageUrl ?? null,
@@ -218,6 +255,58 @@ async function fetchLiveSolPairs(query) {
 }
 
 /* ------------------------------------------------------------
+   Real token discovery. Searching for the literal text "pump"
+   mostly just found the $PUMP token itself, not a broad set of
+   memecoins — wrong tool for the job. This instead pulls from
+   DexScreener's boosted/profiled-token feeds (a real curated
+   universe of active tokens, most with icons already attached),
+   then resolves those addresses to full trading data in one
+   batched call.
+------------------------------------------------------------- */
+async function fetchDiscoveryUniverse() {
+  const [boostsRes, profilesRes] = await Promise.allSettled([
+    fetch(`${DS_BASE}/token-boosts/top/v1`).then((r) => r.json()),
+    fetch(`${DS_BASE}/token-profiles/latest/v1`).then((r) => r.json()),
+  ]);
+  const boosts = boostsRes.status === "fulfilled" && Array.isArray(boostsRes.value) ? boostsRes.value : [];
+  const profiles = profilesRes.status === "fulfilled" && Array.isArray(profilesRes.value) ? profilesRes.value : [];
+  const combined = [...boosts, ...profiles].filter((e) => e.chainId === "solana" && e.tokenAddress);
+
+  const iconByAddress = {};
+  const addresses = [];
+  const seen = new Set();
+  for (const e of combined) {
+    if (!seen.has(e.tokenAddress)) {
+      seen.add(e.tokenAddress);
+      addresses.push(e.tokenAddress);
+    }
+    if (e.icon && !iconByAddress[e.tokenAddress]) iconByAddress[e.tokenAddress] = e.icon;
+  }
+  if (!addresses.length) return [];
+
+  // /latest/dex/tokens/{addresses} accepts up to 30 comma-separated addresses per call
+  const chunks = [];
+  for (let i = 0; i < addresses.length; i += 30) chunks.push(addresses.slice(i, i + 30));
+  const chunkResults = await Promise.allSettled(
+    chunks.map(async (chunk) => {
+      const res = await fetch(`${DS_BASE}/latest/dex/tokens/${chunk.join(",")}`);
+      if (!res.ok) throw new Error("tokens fetch failed");
+      const data = await res.json();
+      return data.pairs || [];
+    })
+  );
+  const rawPairs = chunkResults.flatMap((r) => (r.status === "fulfilled" ? r.value : []));
+
+  return rawPairs
+    .filter((p) => p.chainId === "solana" && p.baseToken?.symbol)
+    .map((p) => {
+      const mapped = mapPair(p);
+      if (!mapped.image && iconByAddress[mapped.address]) mapped.image = iconByAddress[mapped.address];
+      return mapped;
+    });
+}
+
+/* ------------------------------------------------------------
    Wallet tracker — imported from the user's Axiom tracked-wallet
    export. One entry with a slur baked into its label was dropped;
    everything else carried over as-is (name/emoji/address).
@@ -263,7 +352,7 @@ async function fetchOhlcv(pairAddress) {
   return list
     .slice()
     .reverse()
-    .map(([ts, , , , close]) => ({ t: ts * 1000, close }));
+    .map(([ts, open, high, low, close]) => ({ t: ts * 1000, open, high, low, close }));
 }
 
 /* ============================================================
@@ -535,36 +624,47 @@ function EmptyState({ icon: Icon, title, sub }) {
 ============================================================ */
 function TokenCard({ t, onOpen, onToggleWatch, watched, bonding }) {
   const up = (t.change24h ?? 0) >= 0;
-  const showBar = bonding !== undefined && bonding !== null;
+  const showBondingBar = bonding !== undefined && bonding !== null;
   const graduated = bonding >= 100;
   const flash = useFlash(t.marketCap);
+  const buys = t.buys24h ?? 0;
+  const sells = t.sells24h ?? 0;
+  const totalTx = buys + sells;
+  const buyRatio = totalTx > 0 ? buys / totalTx : 0.5;
+  const showTxBar = !showBondingBar && totalTx > 0;
   return (
     <div
       onClick={() => onOpen(t)}
       style={{
-        display: "flex", flexDirection: "column", gap: 8, padding: "12px 14px",
+        display: "flex", flexDirection: "column", gap: 7, padding: "10px 12px",
         borderBottom: `1px solid ${C.borderSoft}`, cursor: "pointer",
       }}
     >
-      <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
-        <Avatar t={t} size={38} radius={10} fontSize={13} />
+      <div style={{ display: "flex", alignItems: "center", gap: 11 }}>
+        <Avatar t={t} size={36} radius={10} fontSize={12.5} />
         <div style={{ flex: 1, minWidth: 0 }}>
           <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-            <span style={{ fontWeight: 700, fontSize: 14.5 }}>{t.symbol}</span>
-            <span style={{ color: C.sub, fontSize: 12.5, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+            <span style={{ fontWeight: 700, fontSize: 14 }}>{t.symbol}</span>
+            <span style={{ color: C.sub, fontSize: 12, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
               {t.name}
             </span>
+            {t.createdAt && (
+              <span style={{ fontSize: 10, color: C.faint, flexShrink: 0, fontFamily: "'JetBrains Mono', monospace" }}>
+                · {timeAgo(t.createdAt)}
+              </span>
+            )}
           </div>
-          <div style={{ display: "flex", gap: 10, marginTop: 2, fontFamily: "'JetBrains Mono', monospace", fontSize: 11.5, color: C.faint }}>
+          <div style={{ display: "flex", gap: 9, marginTop: 2, fontFamily: "'JetBrains Mono', monospace", fontSize: 11, color: C.faint }}>
             <span>${fmtPrice(t.priceUsd)}</span>
             <span>Liq {fmtUsd(t.liquidity)}</span>
             <span>Vol {fmtUsd(t.volume24h)}</span>
+            {totalTx > 0 && <span>{fmtUsd(totalTx)} tx</span>}
           </div>
         </div>
         <div style={{ textAlign: "right", flexShrink: 0 }}>
           <div
             style={{
-              fontFamily: "'JetBrains Mono', monospace", fontWeight: 700, fontSize: 14.5, borderRadius: 6, padding: "1px 4px",
+              fontFamily: "'JetBrains Mono', monospace", fontWeight: 700, fontSize: 14, borderRadius: 6, padding: "1px 4px",
               background: flash === "up" ? C.buyDim : flash === "down" ? C.sellDim : "transparent", transition: "background .5s",
             }}
           >
@@ -573,13 +673,13 @@ function TokenCard({ t, onOpen, onToggleWatch, watched, bonding }) {
           <Pill positive={up}>{pct(t.change24h)}</Pill>
         </div>
         <Star
-          size={16}
+          size={15}
           onClick={(e) => { e.stopPropagation(); onToggleWatch(t); }}
-          style={{ marginLeft: 2, flexShrink: 0, color: watched ? C.amber : C.faint, fill: watched ? C.amber : "none" }}
+          style={{ marginLeft: 1, flexShrink: 0, color: watched ? C.amber : C.faint, fill: watched ? C.amber : "none" }}
         />
       </div>
-      {showBar && (
-        <div style={{ display: "flex", alignItems: "center", gap: 8, paddingLeft: 50 }}>
+      {showBondingBar && (
+        <div style={{ display: "flex", alignItems: "center", gap: 8, paddingLeft: 47 }}>
           <div style={{ flex: 1, height: 5, borderRadius: 99, background: C.panel2, overflow: "hidden" }}>
             <div
               style={{
@@ -593,6 +693,16 @@ function TokenCard({ t, onOpen, onToggleWatch, watched, bonding }) {
           </span>
         </div>
       )}
+      {showTxBar && (
+        <div style={{ display: "flex", alignItems: "center", gap: 8, paddingLeft: 47 }}>
+          <div style={{ flex: 1, height: 4, borderRadius: 99, background: C.sellDim, overflow: "hidden", display: "flex" }}>
+            <div style={{ width: `${buyRatio * 100}%`, background: C.buy, height: "100%" }} />
+          </div>
+          <span style={{ fontSize: 10, fontFamily: "'JetBrains Mono', monospace", flexShrink: 0, color: C.faint }}>
+            <span style={{ color: C.buy }}>{buys}</span>/<span style={{ color: C.sell }}>{sells}</span>
+          </span>
+        </div>
+      )}
     </div>
   );
 }
@@ -600,35 +710,52 @@ function TokenCard({ t, onOpen, onToggleWatch, watched, bonding }) {
 /* ============================================================
    DISCOVER SCREEN
 ============================================================ */
-const DISCOVER_TABS = ["Trending", "New", "Gainers", "Losers", "Volume", "Watchlist"];
+const DISCOVER_TABS = ["Trending", "New", "Gainers", "Losers", "Volume", "Mcap", "Watchlist"];
 
-function DiscoverScreen({ tokens, loading, dataMode, onOpen, watchlist, onToggleWatch, query, setQuery }) {
+const LIQ_FILTERS = [
+  { label: "All", min: 0 },
+  { label: "$5K+ Liq", min: 5000 },
+  { label: "$25K+ Liq", min: 25000 },
+  { label: "$100K+ Liq", min: 100000 },
+];
+
+function DiscoverScreen({ tokens, loading, dataMode, onOpen, watchlist, onToggleWatch, query, setQuery, solPrice }) {
   const [tab, setTab] = useState("Trending");
+  const [minLiq, setMinLiq] = useState(0);
 
-  let list = tokens;
+  let list = tokens.filter((t) => t.liquidity >= minLiq);
   if (query.trim()) {
     const q = query.trim().toLowerCase();
-    list = tokens.filter((t) => t.symbol?.toLowerCase().includes(q) || t.name?.toLowerCase().includes(q));
+    list = list.filter((t) => t.symbol?.toLowerCase().includes(q) || t.name?.toLowerCase().includes(q));
   } else if (tab === "Watchlist") {
-    list = tokens.filter((t) => watchlist.includes(t.address));
+    list = list.filter((t) => watchlist.includes(t.address));
   } else if (tab === "New") {
-    list = [...tokens].sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+    list = [...list].sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
   } else if (tab === "Gainers") {
-    list = [...tokens].sort((a, b) => (b.change24h ?? 0) - (a.change24h ?? 0));
+    list = [...list].sort((a, b) => (b.change24h ?? 0) - (a.change24h ?? 0));
   } else if (tab === "Losers") {
-    list = [...tokens].sort((a, b) => (a.change24h ?? 0) - (b.change24h ?? 0));
+    list = [...list].sort((a, b) => (a.change24h ?? 0) - (b.change24h ?? 0));
   } else if (tab === "Volume") {
-    list = [...tokens].sort((a, b) => (b.volume24h ?? 0) - (a.volume24h ?? 0));
+    list = [...list].sort((a, b) => (b.volume24h ?? 0) - (a.volume24h ?? 0));
+  } else if (tab === "Mcap") {
+    list = [...list].sort((a, b) => (b.marketCap ?? 0) - (a.marketCap ?? 0));
   } else {
-    list = [...tokens].sort((a, b) => (b.volume24h ?? 0) * (1 + (b.change24h ?? 0) / 100) - (a.volume24h ?? 0) * (1 + (a.change24h ?? 0) / 100));
+    list = [...list].sort((a, b) => (b.volume24h ?? 0) * (1 + (b.change24h ?? 0) / 100) - (a.volume24h ?? 0) * (1 + (a.change24h ?? 0) / 100));
   }
+
+  const totalVol = tokens.reduce((s, t) => s + (t.volume24h || 0), 0);
 
   return (
     <div>
       <div style={{ padding: "14px 14px 10px" }}>
-        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 12 }}>
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 10 }}>
           <div style={{ fontSize: 20, fontWeight: 800, letterSpacing: -0.3 }}>Discover</div>
           <LiveBadge dataMode={dataMode} />
+        </div>
+        <div style={{ display: "flex", gap: 14, marginBottom: 12, fontFamily: "'JetBrains Mono', monospace", fontSize: 11, color: C.faint }}>
+          <span>SOL <span style={{ color: C.text, fontWeight: 600 }}>${solPrice.toFixed(2)}</span></span>
+          <span>{tokens.length} tracked</span>
+          <span>{fmtUsd(totalVol)} 24h vol</span>
         </div>
         <div
           style={{
@@ -650,22 +777,40 @@ function DiscoverScreen({ tokens, loading, dataMode, onOpen, watchlist, onToggle
       </div>
 
       {!query.trim() && (
-        <div style={{ display: "flex", gap: 6, padding: "0 14px 12px", overflowX: "auto" }}>
-          {DISCOVER_TABS.map((tb) => (
-            <button
-              key={tb}
-              onClick={() => setTab(tb)}
-              style={{
-                flexShrink: 0, fontSize: 12.5, fontWeight: 600, padding: "7px 13px", borderRadius: 20,
-                border: `1px solid ${tab === tb ? C.amber : C.border}`,
-                background: tab === tb ? C.amberDim : "transparent",
-                color: tab === tb ? C.amber : C.sub, cursor: "pointer",
-              }}
-            >
-              {tb}
-            </button>
-          ))}
-        </div>
+        <>
+          <div style={{ display: "flex", gap: 6, padding: "0 14px 8px", overflowX: "auto" }}>
+            {DISCOVER_TABS.map((tb) => (
+              <button
+                key={tb}
+                onClick={() => setTab(tb)}
+                style={{
+                  flexShrink: 0, fontSize: 12.5, fontWeight: 600, padding: "7px 13px", borderRadius: 20,
+                  border: `1px solid ${tab === tb ? C.amber : C.border}`,
+                  background: tab === tb ? C.amberDim : "transparent",
+                  color: tab === tb ? C.amber : C.sub, cursor: "pointer",
+                }}
+              >
+                {tb}
+              </button>
+            ))}
+          </div>
+          <div style={{ display: "flex", gap: 6, padding: "0 14px 12px", overflowX: "auto" }}>
+            {LIQ_FILTERS.map((f) => (
+              <button
+                key={f.label}
+                onClick={() => setMinLiq(f.min)}
+                style={{
+                  flexShrink: 0, fontSize: 11, fontWeight: 600, padding: "5px 10px", borderRadius: 16,
+                  border: `1px solid ${minLiq === f.min ? C.borderStrong : C.borderSoft}`,
+                  background: minLiq === f.min ? C.panel3 : "transparent",
+                  color: minLiq === f.min ? C.text : C.faint, cursor: "pointer",
+                }}
+              >
+                {f.label}
+              </button>
+            ))}
+          </div>
+        </>
       )}
 
       <div style={{ background: C.panel, borderRadius: 16, margin: "0 10px 20px", border: `1px solid ${C.borderSoft}`, overflow: "hidden" }}>
@@ -680,7 +825,7 @@ function DiscoverScreen({ tokens, loading, dataMode, onOpen, watchlist, onToggle
           <EmptyState
             icon={tab === "Watchlist" ? Star : Search}
             title={tab === "Watchlist" ? "No tokens watched yet" : "No tokens found"}
-            sub={tab === "Watchlist" ? "Tap the star on any token to add it here." : "Try a different search."}
+            sub={tab === "Watchlist" ? "Tap the star on any token to add it here." : "Try a different search or lower the liquidity filter."}
           />
         ) : (
           list.map((t) => (
@@ -841,28 +986,47 @@ function PriceChart({ pairAddress, simulated }) {
     );
   }
 
-  const up = points.length > 1 && points[points.length - 1].close >= points[0].close;
   return (
     <ResponsiveContainer width="100%" height="100%">
-      <AreaChart data={points} margin={{ top: 10, right: 10, bottom: 0, left: 10 }}>
-        <defs>
-          <linearGradient id="priceFill" x1="0" y1="0" x2="0" y2="1">
-            <stop offset="0%" stopColor={up ? C.buy : C.sell} stopOpacity={0.35} />
-            <stop offset="100%" stopColor={up ? C.buy : C.sell} stopOpacity={0} />
-          </linearGradient>
-        </defs>
+      <ComposedChart data={points} margin={{ top: 10, right: 10, bottom: 0, left: 10 }}>
         <XAxis dataKey="t" hide />
         <YAxis domain={["auto", "auto"]} hide />
-        <Area type="monotone" dataKey="close" stroke={up ? C.buy : C.sell} strokeWidth={2} fill="url(#priceFill)" dot={false} isAnimationActive={false} />
-      </AreaChart>
+        <Bar dataKey={(d) => [d.low, d.high]} shape={<Candle />} isAnimationActive={false} />
+      </ComposedChart>
     </ResponsiveContainer>
+  );
+}
+
+// Real OHLC candlestick, drawn manually — recharts has no built-in
+// candlestick type. The Bar's dataKey returns [low, high], so the y/height
+// recharts hands us already correspond to that price range; open/close are
+// interpolated within it to draw the body.
+function Candle(props) {
+  const { x, y, width, height, payload } = props;
+  const { open, close, high, low } = payload;
+  if (high === low || !isFinite(height) || height <= 0) return null;
+  const isUp = close >= open;
+  const color = isUp ? C.buy : C.sell;
+  const ratio = height / (high - low);
+  const openY = y + (high - open) * ratio;
+  const closeY = y + (high - close) * ratio;
+  const bodyY = Math.min(openY, closeY);
+  const bodyHeight = Math.max(Math.abs(closeY - openY), 1.5);
+  const bodyWidth = Math.max(width * 0.6, 2);
+  const bodyX = x + (width - bodyWidth) / 2;
+  const wickX = x + width / 2;
+  return (
+    <g>
+      <line x1={wickX} x2={wickX} y1={y} y2={y + height} stroke={color} strokeWidth={1} />
+      <rect x={bodyX} y={bodyY} width={bodyWidth} height={bodyHeight} fill={color} />
+    </g>
   );
 }
 
 /* ============================================================
    TOKEN DETAIL / TRADE SCREEN
 ============================================================ */
-function TokenScreen({ token, portfolio, setPortfolio, onBack, watched, onToggleWatch, solPrice }) {
+function TokenScreen({ token, portfolio, setPortfolio, onBack, watched, onToggleWatch, solPrice, isDesktop }) {
   const [side, setSide] = useState("buy");
   const [solAmount, setSolAmount] = useState("");
   const [sellPct, setSellPct] = useState(null);
@@ -945,7 +1109,9 @@ function TokenScreen({ token, portfolio, setPortfolio, onBack, watched, onToggle
   const quickBuys = [0.1, 0.5, 1, 2, 5];
 
   return (
-    <div style={{ paddingBottom: 100 }}>
+    <div style={{ paddingBottom: isDesktop ? 24 : 100 }}>
+      <div style={isDesktop ? { display: "flex", gap: 24, alignItems: "flex-start", padding: "14px 20px 24px" } : undefined}>
+      <div style={isDesktop ? { flex: "1 1 0%", minWidth: 0 } : undefined}>
       <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "14px 14px 8px" }}>
         <ChevronLeft size={22} onClick={onBack} style={{ cursor: "pointer" }} />
         <Avatar t={token} size={30} radius={8} fontSize={11} />
@@ -963,7 +1129,7 @@ function TokenScreen({ token, portfolio, setPortfolio, onBack, watched, onToggle
       <div style={{ padding: "4px 14px 12px" }}>
         <div
           style={{
-            fontFamily: "'JetBrains Mono', monospace", fontSize: 28, fontWeight: 700, display: "inline-block",
+            fontFamily: "'JetBrains Mono', monospace", fontSize: 34, fontWeight: 700, letterSpacing: -0.5, display: "inline-block",
             borderRadius: 8, padding: "1px 6px", marginLeft: -6,
             background: mcFlash === "up" ? C.buyDim : mcFlash === "down" ? C.sellDim : "transparent", transition: "background .5s",
           }}
@@ -971,8 +1137,10 @@ function TokenScreen({ token, portfolio, setPortfolio, onBack, watched, onToggle
           {fmtUsd(token.marketCap)}
         </div>
         <div style={{ fontSize: 11.5, color: C.faint, marginTop: 2 }}>Market Cap</div>
-        <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
+        <div style={{ display: "flex", gap: 6, marginTop: 8, flexWrap: "wrap" }}>
+          <Pill positive={(token.change5m ?? 0) >= 0}>5m {pct(token.change5m)}</Pill>
           <Pill positive={(token.change1h ?? 0) >= 0}>1h {pct(token.change1h)}</Pill>
+          <Pill positive={(token.change6h ?? 0) >= 0}>6h {pct(token.change6h)}</Pill>
           <Pill positive={(token.change24h ?? 0) >= 0}>24h {pct(token.change24h)}</Pill>
         </div>
       </div>
@@ -981,21 +1149,47 @@ function TokenScreen({ token, portfolio, setPortfolio, onBack, watched, onToggle
         <PriceChart pairAddress={token.pairAddress} simulated={token.simulated} />
       </div>
 
-      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 8, margin: "0 14px 14px" }}>
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 8, margin: "0 14px 10px" }}>
         {[
-          ["Price", "$" + fmtPrice(token.priceUsd)],
-          ["Liquidity", fmtUsd(token.liquidity)],
-          ["24h Volume", fmtUsd(token.volume24h)],
-        ].map(([label, val]) => (
-          <div key={label} style={{ background: C.panel, border: `1px solid ${C.borderSoft}`, borderRadius: 12, padding: "10px 12px" }}>
-            <div style={{ fontSize: 11, color: C.faint }}>{label}</div>
-            <div style={{ fontFamily: "'JetBrains Mono', monospace", fontWeight: 600, fontSize: 14, marginTop: 2 }}>{val}</div>
+          ["Price", "$" + fmtPrice(token.priceUsd), null],
+          ["Liquidity", fmtUsd(token.liquidity), "How much money sits in the trading pool. Low liquidity means bigger price swings on small trades."],
+          ["24h Volume", fmtUsd(token.volume24h), "Total traded in the last 24 hours. High volume relative to market cap usually means real activity, not just a quiet chart."],
+          ["FDV", fmtUsd(token.fdv), "Fully diluted valuation — price × total supply that will ever exist, vs. market cap which uses circulating supply only."],
+          ["Age", token.createdAt ? timeAgo(token.createdAt) : "—", "How long ago this pair started trading."],
+          ["24h Txns", fmtUsd((token.buys24h || 0) + (token.sells24h || 0)), "Total buy + sell transactions in the last 24 hours."],
+        ].map(([label, val, tip]) => (
+          <div key={label} style={{ background: `linear-gradient(155deg, ${C.panel}, ${C.panel2})`, border: `1px solid ${C.borderSoft}`, boxShadow: "0 1px 0 rgba(255,255,255,0.025) inset, 0 6px 16px rgba(0,0,0,0.18)", borderRadius: 12, padding: "10px 12px" }}>
+            <div style={{ fontSize: 11, color: C.faint }}>
+              {tip ? <Tooltip term={label} def={tip}>{label}</Tooltip> : label}
+            </div>
+            <div style={{ fontFamily: "'JetBrains Mono', monospace", fontWeight: 600, fontSize: 13.5, marginTop: 2 }}>{val}</div>
           </div>
         ))}
       </div>
 
+      {(token.buys24h || token.sells24h) > 0 && (
+        <div style={{ margin: "0 14px 14px", background: `linear-gradient(155deg, ${C.panel}, ${C.panel2})`, border: `1px solid ${C.borderSoft}`, boxShadow: "0 1px 0 rgba(255,255,255,0.025) inset, 0 6px 16px rgba(0,0,0,0.18)", borderRadius: 14, padding: 14 }}>
+          <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12, color: C.faint, marginBottom: 8 }}>
+            <Tooltip term="Buy/Sell Pressure" def="The split between buy and sell transactions in the last 24 hours. More buys than sells doesn't guarantee price goes up, but it's a useful read on sentiment.">
+              Buy/Sell Pressure (24h)
+            </Tooltip>
+            <span style={{ fontFamily: "'JetBrains Mono', monospace" }}>
+              <span style={{ color: C.buy }}>{token.buys24h}</span> / <span style={{ color: C.sell }}>{token.sells24h}</span>
+            </span>
+          </div>
+          <div style={{ height: 8, borderRadius: 99, background: C.sellDim, overflow: "hidden", display: "flex" }}>
+            <div
+              style={{
+                width: `${((token.buys24h || 0) / Math.max(1, (token.buys24h || 0) + (token.sells24h || 0))) * 100}%`,
+                background: C.buy, height: "100%", transition: "width .4s",
+              }}
+            />
+          </div>
+        </div>
+      )}
+
       {posAmount > 0 && (
-        <div style={{ margin: "0 14px 14px", background: C.panel, border: `1px solid ${C.borderSoft}`, borderRadius: 14, padding: 14 }}>
+        <div style={{ margin: "0 14px 14px", background: `linear-gradient(155deg, ${C.panel}, ${C.panel2})`, border: `1px solid ${C.borderSoft}`, boxShadow: "0 1px 0 rgba(255,255,255,0.025) inset, 0 6px 16px rgba(0,0,0,0.18)", borderRadius: 14, padding: 14 }}>
           <div style={{ fontSize: 12, color: C.faint, marginBottom: 8 }}>Your position</div>
           <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 6 }}>
             <span style={{ fontSize: 13, color: C.sub }}>Value</span>
@@ -1025,8 +1219,15 @@ function TokenScreen({ token, portfolio, setPortfolio, onBack, watched, onToggle
           </div>
         </div>
       )}
+      </div>
 
-      <div style={{ position: "fixed", bottom: 0, left: 0, right: 0, maxWidth: 480, margin: "0 auto", background: C.bg, borderTop: `1px solid ${C.border}`, padding: 14 }}>
+      <div
+        style={
+          isDesktop
+            ? { flex: "0 0 360px", position: "sticky", top: 20, background: `linear-gradient(155deg, ${C.panel}, ${C.panel2})`, border: `1px solid ${C.borderSoft}`, boxShadow: "0 1px 0 rgba(255,255,255,0.025) inset, 0 6px 16px rgba(0,0,0,0.18)", borderRadius: 16, padding: 16 }
+            : { position: "fixed", bottom: 0, left: 0, right: 0, maxWidth: 480, margin: "0 auto", background: C.bg, borderTop: `1px solid ${C.border}`, padding: 14 }
+        }
+      >
         <div style={{ display: "flex", gap: 6, marginBottom: 10 }}>
           <button
             onClick={() => setSide("buy")}
@@ -1093,6 +1294,7 @@ function TokenScreen({ token, portfolio, setPortfolio, onBack, watched, onToggle
           </>
         )}
       </div>
+      </div>
 
       {toast && (
         <div
@@ -1142,13 +1344,20 @@ function PortfolioScreen({ portfolio, tokenMap, solPrice, onOpenToken }) {
   const wins = closedTrades.filter((t) => (t.realizedUsd || 0) > 0).length;
   const winRate = closedTrades.length ? (wins / closedTrades.length) * 100 : null;
 
+  const totalUnrealizedPnl = rows.reduce((s, r) => s + r.upnl, 0);
+  const bestTrade = closedTrades.reduce((best, t) => (!best || (t.realizedUsd || 0) > (best.realizedUsd || 0) ? t : best), null);
+  const worstTrade = closedTrades.reduce((worst, t) => (!worst || (t.realizedUsd || 0) < (worst.realizedUsd || 0) ? t : worst), null);
+  const avgPnlPerTrade = closedTrades.length
+    ? closedTrades.reduce((s, t) => s + (t.realizedUsd || 0), 0) / closedTrades.length
+    : null;
+
   return (
     <div style={{ padding: "14px 14px 90px" }}>
       <div style={{ fontSize: 20, fontWeight: 800, marginBottom: 14 }}>Portfolio</div>
 
       <div style={{ background: `linear-gradient(160deg, ${C.panel}, ${C.panel2})`, border: `1px solid ${C.borderSoft}`, borderRadius: 18, padding: 18, marginBottom: 14 }}>
         <div style={{ fontSize: 12, color: C.faint }}>Total value</div>
-        <div style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 30, fontWeight: 700, margin: "4px 0 6px" }}>
+        <div style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 36, fontWeight: 700, letterSpacing: -0.5, margin: "4px 0 6px" }}>
           ${totalValueUsd.toFixed(2)}
         </div>
         <Pill positive={totalReturnPct >= 0}>{pct(totalReturnPct)} all-time</Pill>
@@ -1171,8 +1380,32 @@ function PortfolioScreen({ portfolio, tokenMap, solPrice, onOpenToken }) {
         </div>
       </div>
 
-      <div style={{ fontSize: 13, fontWeight: 700, color: C.sub, margin: "4px 0 8px" }}>Open positions</div>
-      <div style={{ background: C.panel, border: `1px solid ${C.borderSoft}`, borderRadius: 14, overflow: "hidden", marginBottom: 18 }}>
+      <div style={{ fontSize: 11, fontWeight: 700, color: C.amber, margin: "4px 0 8px", textTransform: "uppercase", letterSpacing: 0.8 }}>Trading analytics</div>
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginBottom: 18 }}>
+        {[
+          ["Unrealized PnL", `${totalUnrealizedPnl >= 0 ? "+" : ""}$${totalUnrealizedPnl.toFixed(2)}`, totalUnrealizedPnl >= 0],
+          ["Total Trades", String(portfolio.trades.length), null],
+          ["Avg PnL / Trade", avgPnlPerTrade === null ? "—" : `${avgPnlPerTrade >= 0 ? "+" : ""}$${avgPnlPerTrade.toFixed(2)}`, avgPnlPerTrade === null ? null : avgPnlPerTrade >= 0],
+          ["Best Trade", bestTrade ? `+$${(bestTrade.realizedUsd || 0).toFixed(2)}` : "—", bestTrade ? true : null],
+          ["Worst Trade", worstTrade ? `${(worstTrade.realizedUsd || 0) >= 0 ? "+" : ""}$${(worstTrade.realizedUsd || 0).toFixed(2)}` : "—", worstTrade ? (worstTrade.realizedUsd || 0) >= 0 : null],
+          ["Open Positions", String(rows.length), null],
+        ].map(([label, val, positive]) => (
+          <div key={label} style={{ background: `linear-gradient(155deg, ${C.panel}, ${C.panel2})`, border: `1px solid ${C.borderSoft}`, boxShadow: "0 1px 0 rgba(255,255,255,0.025) inset, 0 6px 16px rgba(0,0,0,0.18)", borderRadius: 12, padding: "10px 12px" }}>
+            <div style={{ fontSize: 11, color: C.faint }}>{label}</div>
+            <div
+              style={{
+                fontFamily: "'JetBrains Mono', monospace", fontWeight: 600, fontSize: 14.5, marginTop: 2,
+                color: positive === null ? C.text : positive ? C.buy : C.sell,
+              }}
+            >
+              {val}
+            </div>
+          </div>
+        ))}
+      </div>
+
+      <div style={{ fontSize: 11, fontWeight: 700, color: C.amber, margin: "4px 0 8px", textTransform: "uppercase", letterSpacing: 0.8 }}>Open positions</div>
+      <div style={{ background: `linear-gradient(155deg, ${C.panel}, ${C.panel2})`, border: `1px solid ${C.borderSoft}`, boxShadow: "0 1px 0 rgba(255,255,255,0.025) inset, 0 6px 16px rgba(0,0,0,0.18)", borderRadius: 14, overflow: "hidden", marginBottom: 18 }}>
         {rows.length === 0 ? (
           <EmptyState icon={Wallet} title="No open positions" sub="Paper-buy a token from Discover to see it here." />
         ) : (
@@ -1196,8 +1429,8 @@ function PortfolioScreen({ portfolio, tokenMap, solPrice, onOpenToken }) {
         )}
       </div>
 
-      <div style={{ fontSize: 13, fontWeight: 700, color: C.sub, margin: "4px 0 8px" }}>Trade history</div>
-      <div style={{ background: C.panel, border: `1px solid ${C.borderSoft}`, borderRadius: 14, overflow: "hidden" }}>
+      <div style={{ fontSize: 11, fontWeight: 700, color: C.amber, margin: "4px 0 8px", textTransform: "uppercase", letterSpacing: 0.8 }}>Trade history</div>
+      <div style={{ background: `linear-gradient(155deg, ${C.panel}, ${C.panel2})`, border: `1px solid ${C.borderSoft}`, boxShadow: "0 1px 0 rgba(255,255,255,0.025) inset, 0 6px 16px rgba(0,0,0,0.18)", borderRadius: 14, overflow: "hidden" }}>
         {portfolio.trades.length === 0 ? (
           <EmptyState icon={Clock} title="No trades yet" sub="Your buy and sell history will show up here." />
         ) : (
@@ -1369,7 +1602,7 @@ function LearnScreen({ beginnerMode, setBeginnerMode }) {
       <div style={{ fontSize: 20, fontWeight: 800, marginBottom: 4 }}>Learn</div>
       <div style={{ fontSize: 13, color: C.sub, marginBottom: 16 }}>The basics, in plain language, before you risk anything real.</div>
 
-      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", background: C.panel, border: `1px solid ${C.borderSoft}`, borderRadius: 14, padding: 14, marginBottom: 18 }}>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", background: `linear-gradient(155deg, ${C.panel}, ${C.panel2})`, border: `1px solid ${C.borderSoft}`, boxShadow: "0 1px 0 rgba(255,255,255,0.025) inset, 0 6px 16px rgba(0,0,0,0.18)", borderRadius: 14, padding: 14, marginBottom: 18 }}>
         <div>
           <div style={{ fontWeight: 700, fontSize: 14 }}>Beginner Mode</div>
           <div style={{ fontSize: 12, color: C.sub, marginTop: 2 }}>Extra warnings and context while you trade</div>
@@ -1382,7 +1615,7 @@ function LearnScreen({ beginnerMode, setBeginnerMode }) {
         </div>
       </div>
 
-      <div style={{ background: C.panel, border: `1px solid ${C.borderSoft}`, borderRadius: 14, overflow: "hidden" }}>
+      <div style={{ background: `linear-gradient(155deg, ${C.panel}, ${C.panel2})`, border: `1px solid ${C.borderSoft}`, boxShadow: "0 1px 0 rgba(255,255,255,0.025) inset, 0 6px 16px rgba(0,0,0,0.18)", borderRadius: 14, overflow: "hidden" }}>
         {LESSONS.map((l, i) => (
           <div key={l.term} style={{ borderBottom: i < LESSONS.length - 1 ? `1px solid ${C.borderSoft}` : "none" }}>
             <div
@@ -1414,6 +1647,7 @@ export default function App() {
   const [query, setQuery] = useState("");
   const [solPrice, setSolPrice] = useState(SOL_FALLBACK_PRICE);
   const [portfolio, setPortfolio, ready] = usePortfolio();
+  const isDesktop = useIsDesktop();
 
   const tokenMap = Object.fromEntries(tokens.map((t) => [t.address, t]));
 
@@ -1422,19 +1656,19 @@ export default function App() {
     try {
       const [solRes, memeRes] = await Promise.allSettled([
         fetchLiveSolPairs("SOL USDC"),
-        fetchLiveSolPairs("pump"),
+        fetchDiscoveryUniverse(),
       ]);
       let sol = solRes.status === "fulfilled" ? solRes.value.find((p) => p.symbol === "SOL") : null;
       let meme = memeRes.status === "fulfilled" ? memeRes.value : [];
-      meme = meme.filter((t) => t.symbol !== "SOL" && t.liquidity > 1000);
+      meme = meme.filter((t) => t.symbol !== "SOL" && t.liquidity > 500);
 
       if (meme.length >= 5) {
-        // dedupe by symbol, keep highest liquidity
-        const bySym = {};
+        // dedupe by token address (not symbol — different mints can share a ticker)
+        const byAddr = {};
         meme.forEach((t) => {
-          if (!bySym[t.symbol] || t.liquidity > bySym[t.symbol].liquidity) bySym[t.symbol] = t;
+          if (!byAddr[t.address] || t.liquidity > byAddr[t.address].liquidity) byAddr[t.address] = t;
         });
-        setTokens(Object.values(bySym).slice(0, 40));
+        setTokens(Object.values(byAddr).slice(0, 60));
         setDataMode("live");
         if (sol?.priceUsd) setSolPrice(sol.priceUsd);
       } else {
@@ -1496,7 +1730,15 @@ export default function App() {
   ];
 
   return (
-    <div style={{ background: C.bg, minHeight: "100%", maxWidth: 480, margin: "0 auto", fontFamily: "'Inter', sans-serif", color: C.text, position: "relative" }}>
+    <div
+      style={{
+        background: `radial-gradient(ellipse 900px 500px at 50% -10%, ${C.panel3}55, ${C.bg} 60%)`,
+        minHeight: "100%",
+        maxWidth: isDesktop ? 1200 : 480, margin: "0 auto",
+        paddingLeft: isDesktop ? 220 : 0,
+        fontFamily: "'Inter', sans-serif", color: C.text, position: "relative",
+      }}
+    >
       <style>{FONT_CSS}{`
         * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
         input::placeholder { color: ${C.faint}; }
@@ -1515,63 +1757,101 @@ export default function App() {
           watched={portfolio.watchlist.includes(selected.address)}
           onToggleWatch={toggleWatch}
           solPrice={solPrice}
+          isDesktop={isDesktop}
         />
       ) : (
         <>
-          {tab === "discover" && (
-            <DiscoverScreen
-              tokens={tokens}
-              loading={loading}
-              dataMode={dataMode}
-              onOpen={setSelected}
-              watchlist={portfolio.watchlist}
-              onToggleWatch={toggleWatch}
-              query={query}
-              setQuery={setQuery}
-            />
-          )}
-          {tab === "memescope" && (
-            <MemescopeScreen
-              tokens={tokens}
-              dataMode={dataMode}
-              onOpen={setSelected}
-              watchlist={portfolio.watchlist}
-              onToggleWatch={toggleWatch}
-              solPrice={solPrice}
-            />
-          )}
-          {tab === "wallets" && <WalletsScreen />}
-          {tab === "portfolio" && (
-            <PortfolioScreen portfolio={portfolio} tokenMap={tokenMap} solPrice={solPrice} onOpenToken={setSelected} />
-          )}
-          {tab === "learn" && (
-            <LearnScreen
-              beginnerMode={portfolio.beginnerMode}
-              setBeginnerMode={(v) => setPortfolio((p) => ({ ...p, beginnerMode: v }))}
-            />
-          )}
-
-          <div
-            style={{
-              position: "fixed", bottom: 0, left: 0, right: 0, maxWidth: 480, margin: "0 auto",
-              display: "flex", background: C.panel, borderTop: `1px solid ${C.border}`, padding: "8px 0 10px",
-            }}
-          >
-            {NAV.map((n) => {
-              const Icon = n.icon;
-              const active = tab === n.id;
-              return (
-                <div
-                  key={n.id}
-                  onClick={() => setTab(n.id)}
-                  style={{ flex: 1, display: "flex", flexDirection: "column", alignItems: "center", gap: 3, cursor: "pointer" }}
-                >
-                  <Icon size={20} color={active ? C.amber : C.faint} />
-                  <span style={{ fontSize: 10.5, fontWeight: 600, color: active ? C.amber : C.faint }}>{n.label}</span>
-                </div>
-              );
-            })}
+          <div style={isDesktop ? { maxWidth: 760, margin: "0 auto" } : undefined}>
+            {tab === "discover" && (
+              <DiscoverScreen
+                tokens={tokens}
+                loading={loading}
+                dataMode={dataMode}
+                onOpen={setSelected}
+                watchlist={portfolio.watchlist}
+                onToggleWatch={toggleWatch}
+                query={query}
+                setQuery={setQuery}
+                solPrice={solPrice}
+              />
+            )}
+            {tab === "memescope" && (
+              <MemescopeScreen
+                tokens={tokens}
+                dataMode={dataMode}
+                onOpen={setSelected}
+                watchlist={portfolio.watchlist}
+                onToggleWatch={toggleWatch}
+                solPrice={solPrice}
+              />
+            )}
+            {tab === "wallets" && <WalletsScreen />}
+            {tab === "portfolio" && (
+              <PortfolioScreen portfolio={portfolio} tokenMap={tokenMap} solPrice={solPrice} onOpenToken={setSelected} />
+            )}
+            {tab === "learn" && (
+              <LearnScreen
+                beginnerMode={portfolio.beginnerMode}
+                setBeginnerMode={(v) => setPortfolio((p) => ({ ...p, beginnerMode: v }))}
+              />
+            )}
           </div>
+
+          {isDesktop ? (
+            <div
+              style={{
+                position: "fixed", top: 0, left: "max(0px, calc(50% - 600px))", bottom: 0, width: 220,
+                display: "flex", flexDirection: "column", gap: 4, background: C.panel,
+                borderRight: `1px solid ${C.border}`, padding: "20px 12px",
+              }}
+            >
+              <div style={{ fontWeight: 800, fontSize: 16, padding: "0 10px 20px", letterSpacing: -0.3 }}>
+                <span style={{ color: C.amber }}>●</span> Paper Trader
+              </div>
+              {NAV.map((n) => {
+                const Icon = n.icon;
+                const active = tab === n.id;
+                return (
+                  <div
+                    key={n.id}
+                    onClick={() => setTab(n.id)}
+                    style={{
+                      display: "flex", alignItems: "center", gap: 10, padding: "10px 12px", borderRadius: 10,
+                      cursor: "pointer", background: active ? C.amberDim : "transparent",
+                      color: active ? C.amber : C.sub, fontWeight: 600, fontSize: 14,
+                      boxShadow: active ? `inset 3px 0 0 ${C.amber}` : "none",
+                      transition: "background .15s, box-shadow .15s",
+                    }}
+                  >
+                    <Icon size={18} />
+                    {n.label}
+                  </div>
+                );
+              })}
+            </div>
+          ) : (
+            <div
+              style={{
+                position: "fixed", bottom: 0, left: 0, right: 0, maxWidth: 480, margin: "0 auto",
+                display: "flex", background: C.panel, borderTop: `1px solid ${C.border}`, padding: "8px 0 10px",
+              }}
+            >
+              {NAV.map((n) => {
+                const Icon = n.icon;
+                const active = tab === n.id;
+                return (
+                  <div
+                    key={n.id}
+                    onClick={() => setTab(n.id)}
+                    style={{ flex: 1, display: "flex", flexDirection: "column", alignItems: "center", gap: 3, cursor: "pointer" }}
+                  >
+                    <Icon size={20} color={active ? C.amber : C.faint} />
+                    <span style={{ fontSize: 10.5, fontWeight: 600, color: active ? C.amber : C.faint }}>{n.label}</span>
+                  </div>
+                );
+              })}
+            </div>
+          )}
         </>
       )}
     </div>
