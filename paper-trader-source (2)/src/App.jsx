@@ -264,6 +264,13 @@ async function fetchLiveSolPairs(query) {
    then resolves those addresses to full trading data in one
    batched call.
 ------------------------------------------------------------- */
+async function fetchTokenPaidStatus(tokenAddress) {
+  const res = await fetch(`${DS_BASE}/orders/v1/solana/${tokenAddress}`);
+  if (!res.ok) throw new Error("orders fetch failed");
+  const orders = await res.json();
+  return Array.isArray(orders) && orders.some((o) => o.status === "approved");
+}
+
 async function fetchDiscoveryUniverse() {
   const [topBoostsRes, latestBoostsRes, profilesRes] = await Promise.allSettled([
     fetch(`${DS_BASE}/token-boosts/top/v1`).then((r) => r.json()),
@@ -590,6 +597,47 @@ function Tooltip({ term, def, children }) {
   );
 }
 
+function Sparkline({ data, width = 52, height = 22, color }) {
+  if (!data || data.length < 2) return <div style={{ width, height, flexShrink: 0 }} />;
+  const min = Math.min(...data);
+  const max = Math.max(...data);
+  const range = max - min || max || 1;
+  const pts = data.map((v, i) => `${(i / (data.length - 1)) * width},${height - ((v - min) / range) * (height - 2) - 1}`).join(" ");
+  return (
+    <svg width={width} height={height} style={{ flexShrink: 0 }}>
+      <polyline points={pts} fill="none" stroke={color} strokeWidth="1.4" strokeLinejoin="round" strokeLinecap="round" />
+    </svg>
+  );
+}
+
+function WatchlistTicker({ watchlist, tokenMap, onOpen }) {
+  const items = watchlist.map((addr) => tokenMap[addr]).filter(Boolean);
+  if (items.length === 0) return null;
+  return (
+    <div style={{ display: "flex", gap: 8, overflowX: "auto", padding: "8px 14px", borderBottom: `1px solid ${C.borderSoft}` }}>
+      {items.map((t) => {
+        const up = (t.change24h ?? 0) >= 0;
+        return (
+          <div
+            key={t.address}
+            onClick={() => onOpen(t)}
+            style={{
+              display: "flex", alignItems: "center", gap: 6, flexShrink: 0, cursor: "pointer",
+              background: C.panel2, border: `1px solid ${C.borderSoft}`, borderRadius: 20, padding: "4px 10px",
+            }}
+          >
+            <Star size={10} color={C.amber} fill={C.amber} />
+            <span style={{ fontSize: 11.5, fontWeight: 700 }}>{t.symbol}</span>
+            <span style={{ fontSize: 10.5, fontFamily: "'JetBrains Mono', monospace", color: up ? C.buy : C.sell }}>
+              {pct(t.change24h)}
+            </span>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
 function Avatar({ t, size = 38, radius = 10, fontSize }) {
   const [broken, setBroken] = useState(false);
   const showImg = !!t?.image && !broken;
@@ -656,7 +704,7 @@ function EmptyState({ icon: Icon, title, sub }) {
 /* ============================================================
    TOKEN LIST CARD
 ============================================================ */
-function TokenCard({ t, onOpen, onToggleWatch, watched, bonding }) {
+function TokenCard({ t, onOpen, onToggleWatch, watched, bonding, sparkline }) {
   const up = (t.change24h ?? 0) >= 0;
   const showBondingBar = bonding !== undefined && bonding !== null;
   const graduated = bonding >= 100;
@@ -695,6 +743,9 @@ function TokenCard({ t, onOpen, onToggleWatch, watched, bonding }) {
             {totalTx > 0 && <span>{fmtUsd(totalTx)} tx</span>}
           </div>
         </div>
+        {sparkline && sparkline.length >= 2 && (
+          <Sparkline data={sparkline} color={up ? C.buy : C.sell} />
+        )}
         <div style={{ textAlign: "right", flexShrink: 0 }}>
           <div
             style={{
@@ -753,7 +804,7 @@ const LIQ_FILTERS = [
   { label: "$100K+ Liq", min: 100000 },
 ];
 
-function DiscoverScreen({ tokens, loading, dataMode, onOpen, watchlist, onToggleWatch, query, setQuery, solPrice, compact }) {
+function DiscoverScreen({ tokens, loading, dataMode, onOpen, watchlist, onToggleWatch, query, setQuery, solPrice, compact, priceHistory }) {
   const [tab, setTab] = useState("Trending");
   const [minLiq, setMinLiq] = useState(0);
 
@@ -865,7 +916,7 @@ function DiscoverScreen({ tokens, loading, dataMode, onOpen, watchlist, onToggle
           />
         ) : (
           list.map((t) => (
-            <TokenCard key={t.address} t={t} onOpen={onOpen} onToggleWatch={onToggleWatch} watched={watchlist.includes(t.address)} />
+            <TokenCard key={t.address} t={t} onOpen={onOpen} onToggleWatch={onToggleWatch} watched={watchlist.includes(t.address)} sparkline={priceHistory?.[t.address]} />
           ))
         )}
       </div>
@@ -883,7 +934,7 @@ const MEME_TABS = [
   { id: "graduated", label: "Bonded", icon: Check },
 ];
 
-function MemescopeScreen({ tokens, dataMode, onOpen, watchlist, onToggleWatch, solPrice }) {
+function MemescopeScreen({ tokens, dataMode, onOpen, watchlist, onToggleWatch, solPrice, priceHistory }) {
   const [tab, setTab] = useState("new");
   const now = Date.now();
 
@@ -967,6 +1018,7 @@ function MemescopeScreen({ tokens, dataMode, onOpen, watchlist, onToggleWatch, s
               onToggleWatch={onToggleWatch}
               watched={watchlist.includes(t.address)}
               bonding={t._bonding}
+              sparkline={priceHistory?.[t.address]}
             />
           ))
         )}
@@ -1059,6 +1111,22 @@ function Candle(props) {
   );
 }
 
+function usePaidStatus(tokenAddress, simulated) {
+  const [paid, setPaid] = useState(null); // null = unknown/loading
+  useEffect(() => {
+    if (simulated || !tokenAddress) {
+      setPaid(null);
+      return;
+    }
+    let cancelled = false;
+    fetchTokenPaidStatus(tokenAddress)
+      .then((v) => { if (!cancelled) setPaid(v); })
+      .catch(() => { if (!cancelled) setPaid(null); });
+    return () => { cancelled = true; };
+  }, [tokenAddress, simulated]);
+  return paid;
+}
+
 function ContractSafetyPanel({ tokenAddress, simulated }) {
   const [state, setState] = useState({ status: "loading", data: null });
 
@@ -1143,6 +1211,7 @@ function TokenScreen({ token, portfolio, setPortfolio, onBack, watched, onToggle
 
   const priceUsd = token.priceUsd;
   const mcFlash = useFlash(token.marketCap);
+  const paidStatus = usePaidStatus(token.address, token.simulated);
   const posAmount = holding?.amount || 0;
   const posValueUsd = posAmount * priceUsd;
   const posCostUsd = posAmount * (holding?.avgEntry || 0);
@@ -1241,7 +1310,19 @@ function TokenScreen({ token, portfolio, setPortfolio, onBack, watched, onToggle
         <ChevronLeft size={22} onClick={onBack} style={{ cursor: "pointer" }} />
         <Avatar t={token} size={30} radius={8} fontSize={11} />
         <div style={{ flex: 1 }}>
-          <div style={{ fontWeight: 700, fontSize: 15 }}>{token.symbol}</div>
+          <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+            <span style={{ fontWeight: 700, fontSize: 15 }}>{token.symbol}</span>
+            {paidStatus !== null && (
+              <span
+                style={{
+                  fontSize: 9, fontWeight: 700, padding: "2px 5px", borderRadius: 5,
+                  background: paidStatus ? C.buyDim : C.panel2, color: paidStatus ? C.buy : C.faint,
+                }}
+              >
+                {paidStatus ? "PAID" : "UNPAID"}
+              </span>
+            )}
+          </div>
           <div style={{ fontSize: 11.5, color: C.sub }}>{token.name}</div>
         </div>
         <Star
@@ -1820,6 +1901,19 @@ export default function App() {
   const isDesktop = useIsDesktop();
 
   const tokenMap = Object.fromEntries(tokens.map((t) => [t.address, t]));
+  const [priceHistory, setPriceHistory] = useState({});
+
+  useEffect(() => {
+    if (tokens.length === 0) return;
+    setPriceHistory((prev) => {
+      const next = { ...prev };
+      for (const t of tokens) {
+        const arr = next[t.address] ? next[t.address].slice(-19) : [];
+        next[t.address] = [...arr, t.marketCap];
+      }
+      return next;
+    });
+  }, [tokens]);
 
   const loadData = useCallback(async () => {
     setLoading(true);
@@ -1975,6 +2069,7 @@ export default function App() {
         />
       ) : (
         <>
+          <WatchlistTicker watchlist={portfolio.watchlist} tokenMap={tokenMap} onOpen={setSelected} />
           {/* Desktop: browsing + a selected token render side by side, terminal-style —
               no full navigation away from the list. Mobile keeps the full-screen
               takeover above, since there isn't room for both at once. */}
@@ -2001,6 +2096,7 @@ export default function App() {
                   setQuery={setQuery}
                   solPrice={solPrice}
                   compact={isDesktop && !!selected}
+                  priceHistory={priceHistory}
                 />
               )}
               {tab === "memescope" && (
@@ -2011,6 +2107,7 @@ export default function App() {
                   watchlist={portfolio.watchlist}
                   onToggleWatch={toggleWatch}
                   solPrice={solPrice}
+                  priceHistory={priceHistory}
                 />
               )}
               {tab === "wallets" && <WalletsScreen />}
