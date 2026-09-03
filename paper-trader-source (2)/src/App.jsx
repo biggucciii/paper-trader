@@ -3,7 +3,7 @@ import { ComposedChart, Bar, XAxis, YAxis, ResponsiveContainer } from "recharts"
 import {
   Search, Star, ArrowUpRight, ArrowDownRight, ChevronLeft, X, Info,
   TrendingUp, TrendingDown, Flame, Clock, BarChart3, Wallet, GraduationCap,
-  Compass, Settings, CircleAlert, ShieldAlert, Check, RefreshCw, Rocket, Sparkles, Users, ExternalLink
+  Compass, Settings, CircleAlert, ShieldAlert, Check, RefreshCw, Rocket, Sparkles, Users, ExternalLink, Bell
 } from "lucide-react";
 
 /* ============================================================
@@ -393,7 +393,7 @@ async function fetchOhlcv(pairAddress) {
   return list
     .slice()
     .reverse()
-    .map(([ts, open, high, low, close]) => ({ t: ts * 1000, open, high, low, close }));
+    .map(([ts, open, high, low, close, volume]) => ({ t: ts * 1000, open, high, low, close, volume }));
 }
 
 /* ============================================================
@@ -406,6 +406,8 @@ const DEFAULT_STATE = {
   watchlist: [],
   beginnerMode: true,
   realizedPnl: 0,
+  orders: [], // pending limit orders: {id, type: buy|sell, address, symbol, name, targetPrice, solAmount|pct, status, createdAt}
+  notifications: [], // {id, kind, message, time, read}
 };
 
 const TRACKED_WALLETS = [
@@ -673,6 +675,59 @@ function useFlash(value) {
     return () => { if (timerRef.current) clearTimeout(timerRef.current); };
   }, [value]);
   return dir;
+}
+
+function NotificationBell({ portfolio, setPortfolio }) {
+  const [open, setOpen] = useState(false);
+  const unread = portfolio.notifications.filter((n) => !n.read).length;
+
+  function toggle() {
+    const next = !open;
+    setOpen(next);
+    if (next && unread > 0) {
+      setPortfolio((p) => ({ ...p, notifications: p.notifications.map((n) => ({ ...n, read: true })) }));
+    }
+  }
+
+  return (
+    <div style={{ position: "relative" }}>
+      <div onClick={toggle} style={{ cursor: "pointer", position: "relative", display: "flex", alignItems: "center" }}>
+        <Bell size={18} color={open ? C.amber : C.sub} />
+        {unread > 0 && (
+          <span
+            style={{
+              position: "absolute", top: -4, right: -5, background: C.sell, color: "#fff", fontSize: 9, fontWeight: 700,
+              borderRadius: 99, minWidth: 15, height: 15, display: "flex", alignItems: "center", justifyContent: "center", padding: "0 3px",
+            }}
+          >
+            {unread > 9 ? "9+" : unread}
+          </span>
+        )}
+      </div>
+      {open && (
+        <div
+          style={{
+            position: "absolute", top: "130%", right: 0, width: 300, maxHeight: 380, overflowY: "auto",
+            background: C.panel2, border: `1px solid ${C.border}`, borderRadius: 12, boxShadow: "0 14px 34px rgba(0,0,0,.55)", zIndex: 300,
+          }}
+        >
+          <div style={{ padding: "10px 14px", fontSize: 11, fontWeight: 700, color: C.faint, borderBottom: `1px solid ${C.borderSoft}`, textTransform: "uppercase", letterSpacing: 0.6 }}>
+            Notifications
+          </div>
+          {portfolio.notifications.length === 0 ? (
+            <div style={{ padding: "24px 16px", textAlign: "center", fontSize: 12.5, color: C.faint }}>Nothing yet — trade fills and TP/SL/limit orders will show up here.</div>
+          ) : (
+            portfolio.notifications.slice(0, 30).map((n) => (
+              <div key={n.id} style={{ padding: "10px 14px", borderBottom: `1px solid ${C.borderSoft}`, fontSize: 12.5 }}>
+                <div style={{ color: C.text, lineHeight: 1.4 }}>{n.message}</div>
+                <div style={{ color: C.faint, fontSize: 10.5, marginTop: 3, fontFamily: "'JetBrains Mono', monospace" }}>{timeAgo(n.time)}</div>
+              </div>
+            ))
+          )}
+        </div>
+      )}
+    </div>
+  );
 }
 
 function LiveBadge({ dataMode }) {
@@ -1029,7 +1084,7 @@ function MemescopeScreen({ tokens, dataMode, onOpen, watchlist, onToggleWatch, s
 
 function PriceChart({ pairAddress, simulated }) {
   const [points, setPoints] = useState(null);
-  const [status, setStatus] = useState("loading"); // loading | ok | empty
+  const [status, setStatus] = useState("loading");
 
   useEffect(() => {
     if (simulated || !pairAddress) {
@@ -1069,7 +1124,7 @@ function PriceChart({ pairAddress, simulated }) {
     return (
       <div style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", height: "100%", color: C.faint, fontSize: 12.5, gap: 6, textAlign: "center", padding: "0 20px" }}>
         <BarChart3 size={22} />
-        {simulated ? "Simulated token — no real chart data" : "No live chart data available for this pair yet"}
+        {simulated ? "Simulated token — no real chart data (preview-only fallback chart; the deployed build uses real candlesticks)" : "No live chart data available for this pair yet"}
       </div>
     );
   }
@@ -1079,22 +1134,23 @@ function PriceChart({ pairAddress, simulated }) {
       <ComposedChart data={points} margin={{ top: 10, right: 10, bottom: 0, left: 10 }}>
         <XAxis dataKey="t" hide />
         <YAxis domain={["auto", "auto"]} hide />
-        <Bar dataKey={(d) => [d.low, d.high]} shape={<Candle />} isAnimationActive={false} />
+        <Bar dataKey={(d) => [d.low, d.high]} shape={<PreviewCandle />} isAnimationActive={false} />
       </ComposedChart>
     </ResponsiveContainer>
   );
 }
 
-// Real OHLC candlestick, drawn manually — recharts has no built-in
-// candlestick type. The Bar's dataKey returns [low, high], so the y/height
-// recharts hands us already correspond to that price range; open/close are
-// interpolated within it to draw the body.
-function Candle(props) {
+// NOTE: this artifact-preview build uses a recharts-based candlestick
+// because lightweight-charts isn't in the small set of libraries the
+// Claude.ai artifact sandbox bundles. The deployable project (the zip)
+// uses the real lightweight-charts implementation with proper
+// zoom/pan/crosshair and a volume pane — this is a preview-only stand-in
+// so layout/flow can still be checked here.
+function PreviewCandle(props) {
   const { x, y, width, height, payload } = props;
   const { open, close, high, low } = payload;
   if (high === low || !isFinite(height) || height <= 0) return null;
-  const isUp = close >= open;
-  const color = isUp ? C.buy : C.sell;
+  const color = close >= open ? C.buy : C.sell;
   const ratio = height / (high - low);
   const openY = y + (high - open) * ratio;
   const closeY = y + (high - close) * ratio;
@@ -1109,22 +1165,6 @@ function Candle(props) {
       <rect x={bodyX} y={bodyY} width={bodyWidth} height={bodyHeight} fill={color} />
     </g>
   );
-}
-
-function usePaidStatus(tokenAddress, simulated) {
-  const [paid, setPaid] = useState(null); // null = unknown/loading
-  useEffect(() => {
-    if (simulated || !tokenAddress) {
-      setPaid(null);
-      return;
-    }
-    let cancelled = false;
-    fetchTokenPaidStatus(tokenAddress)
-      .then((v) => { if (!cancelled) setPaid(v); })
-      .catch(() => { if (!cancelled) setPaid(null); });
-    return () => { cancelled = true; };
-  }, [tokenAddress, simulated]);
-  return paid;
 }
 
 function ContractSafetyPanel({ tokenAddress, simulated }) {
@@ -1199,6 +1239,8 @@ function ContractSafetyPanel({ tokenAddress, simulated }) {
 ============================================================ */
 function TokenScreen({ token, portfolio, setPortfolio, onBack, watched, onToggleWatch, solPrice, isDesktop }) {
   const [side, setSide] = useState("buy");
+  const [orderType, setOrderType] = useState("market");
+  const [limitPrice, setLimitPrice] = useState("");
   const [solAmount, setSolAmount] = useState("");
   const [sellPct, setSellPct] = useState(null);
   const [toast, setToast] = useState(null);
@@ -1281,6 +1323,36 @@ function TokenScreen({ token, portfolio, setPortfolio, onBack, watched, onToggle
   }
 
   const quickBuys = [0.1, 0.5, 1, 2, 5];
+
+  function placeLimitBuy(sol, targetPriceStr) {
+    const solNum = parseFloat(sol);
+    const tp = parseFloat(targetPriceStr);
+    if (!solNum || solNum <= 0 || solNum > portfolio.balance || !tp || tp <= 0) return;
+    setPortfolio((p) => ({
+      ...p,
+      orders: [
+        { id: uid(), type: "buy", address: token.address, symbol: token.symbol, name: token.name, targetPrice: tp, solAmount: solNum, status: "pending", createdAt: Date.now() },
+        ...p.orders,
+      ],
+    }));
+    flashToast(`Limit buy placed: ${token.symbol} at $${fmtPrice(tp)}`, "buy");
+    setSolAmount("");
+    setLimitPrice("");
+  }
+
+  function placeLimitSell(pctVal, targetPriceStr) {
+    const tp = parseFloat(targetPriceStr);
+    if (!holding || !pctVal || !tp || tp <= 0) return;
+    setPortfolio((p) => ({
+      ...p,
+      orders: [
+        { id: uid(), type: "sell", address: token.address, symbol: token.symbol, name: token.name, targetPrice: tp, pct: pctVal, status: "pending", createdAt: Date.now() },
+        ...p.orders,
+      ],
+    }));
+    flashToast(`Limit sell placed: ${token.symbol} at $${fmtPrice(tp)}`, "sell");
+    setLimitPrice("");
+  }
 
   useEffect(() => {
     setTpInput(holding?.tpPct != null ? String(holding.tpPct) : "");
@@ -1490,6 +1562,32 @@ function TokenScreen({ token, portfolio, setPortfolio, onBack, watched, onToggle
 
         {side === "buy" ? (
           <>
+            <div style={{ display: "flex", gap: 4, marginBottom: 8 }}>
+              {["market", "limit"].map((ot) => (
+                <button
+                  key={ot}
+                  onClick={() => setOrderType(ot)}
+                  style={{
+                    flex: 1, padding: "5px 0", borderRadius: 7, border: `1px solid ${orderType === ot ? C.borderStrong : C.borderSoft}`,
+                    background: orderType === ot ? C.panel3 : "transparent", color: orderType === ot ? C.text : C.faint,
+                    fontSize: 11, fontWeight: 600, cursor: "pointer", textTransform: "capitalize",
+                  }}
+                >
+                  {ot}
+                </button>
+              ))}
+            </div>
+            {orderType === "limit" && (
+              <div style={{ display: "flex", alignItems: "center", background: C.panel, border: `1px solid ${C.border}`, borderRadius: 12, padding: "10px 12px", marginBottom: 8 }}>
+                <span style={{ color: C.faint, fontSize: 12, marginRight: 6 }}>Trigger $</span>
+                <input
+                  value={limitPrice}
+                  onChange={(e) => setLimitPrice(e.target.value.replace(/[^0-9.]/g, ""))}
+                  placeholder={fmtPrice(priceUsd)}
+                  style={{ flex: 1, background: "transparent", border: "none", outline: "none", color: C.text, fontSize: 14, fontFamily: "'JetBrains Mono', monospace" }}
+                />
+              </div>
+            )}
             <div style={{ display: "flex", alignItems: "center", background: C.panel, border: `1px solid ${C.border}`, borderRadius: 12, padding: "10px 12px", marginBottom: 8 }}>
               <input
                 value={solAmount}
@@ -1508,16 +1606,52 @@ function TokenScreen({ token, portfolio, setPortfolio, onBack, watched, onToggle
             <div style={{ fontSize: 11.5, color: C.faint, marginBottom: 10, fontFamily: "'JetBrains Mono', monospace" }}>
               Balance: {fmtSol(portfolio.balance)} SOL · ≈ {solAmount ? fmtUsd((parseFloat(solAmount) || 0) / priceUsd) : "0"} {token.symbol}
             </div>
-            <button
-              onClick={() => executeBuy(solAmount)}
-              disabled={!solAmount || parseFloat(solAmount) <= 0 || parseFloat(solAmount) > portfolio.balance}
-              style={{ ...actionBtn, background: C.buy, opacity: (!solAmount || parseFloat(solAmount) <= 0 || parseFloat(solAmount) > portfolio.balance) ? 0.4 : 1 }}
-            >
-              Buy {token.symbol}
-            </button>
+            {orderType === "market" ? (
+              <button
+                onClick={() => executeBuy(solAmount)}
+                disabled={!solAmount || parseFloat(solAmount) <= 0 || parseFloat(solAmount) > portfolio.balance}
+                style={{ ...actionBtn, background: C.buy, opacity: (!solAmount || parseFloat(solAmount) <= 0 || parseFloat(solAmount) > portfolio.balance) ? 0.4 : 1 }}
+              >
+                Buy {token.symbol}
+              </button>
+            ) : (
+              <button
+                onClick={() => placeLimitBuy(solAmount, limitPrice)}
+                disabled={!solAmount || parseFloat(solAmount) <= 0 || parseFloat(solAmount) > portfolio.balance || !limitPrice || parseFloat(limitPrice) <= 0}
+                style={{ ...actionBtn, background: C.amber, opacity: (!solAmount || parseFloat(solAmount) <= 0 || parseFloat(solAmount) > portfolio.balance || !limitPrice || parseFloat(limitPrice) <= 0) ? 0.4 : 1 }}
+              >
+                Place Limit Buy
+              </button>
+            )}
           </>
         ) : (
           <>
+            <div style={{ display: "flex", gap: 4, marginBottom: 8 }}>
+              {["market", "limit"].map((ot) => (
+                <button
+                  key={ot}
+                  onClick={() => setOrderType(ot)}
+                  style={{
+                    flex: 1, padding: "5px 0", borderRadius: 7, border: `1px solid ${orderType === ot ? C.borderStrong : C.borderSoft}`,
+                    background: orderType === ot ? C.panel3 : "transparent", color: orderType === ot ? C.text : C.faint,
+                    fontSize: 11, fontWeight: 600, cursor: "pointer", textTransform: "capitalize",
+                  }}
+                >
+                  {ot}
+                </button>
+              ))}
+            </div>
+            {orderType === "limit" && (
+              <div style={{ display: "flex", alignItems: "center", background: C.panel, border: `1px solid ${C.border}`, borderRadius: 12, padding: "10px 12px", marginBottom: 8 }}>
+                <span style={{ color: C.faint, fontSize: 12, marginRight: 6 }}>Trigger $</span>
+                <input
+                  value={limitPrice}
+                  onChange={(e) => setLimitPrice(e.target.value.replace(/[^0-9.]/g, ""))}
+                  placeholder={fmtPrice(priceUsd)}
+                  style={{ flex: 1, background: "transparent", border: "none", outline: "none", color: C.text, fontSize: 14, fontFamily: "'JetBrains Mono', monospace" }}
+                />
+              </div>
+            )}
             <div style={{ display: "flex", gap: 6, marginBottom: 10 }}>
               {[25, 50, 75, 100].map((v) => (
                 <button key={v} onClick={() => setSellPct(v)} style={{ ...qbBtn, background: sellPct === v ? C.sellDim : C.panel2, borderColor: sellPct === v ? C.sell : C.border, color: sellPct === v ? C.sell : C.sub }}>
@@ -1528,6 +1662,7 @@ function TokenScreen({ token, portfolio, setPortfolio, onBack, watched, onToggle
             <div style={{ fontSize: 11.5, color: C.faint, marginBottom: 10, fontFamily: "'JetBrains Mono', monospace" }}>
               {holding ? `Position: ${fmtUsd(holding.amount)} ${token.symbol} · $${posValueUsd.toFixed(2)}` : "No position"}
             </div>
+            {orderType === "market" ? (
             <button
               onClick={() => sellPct && executeSell(sellPct)}
               disabled={!sellPct || !holding}
@@ -1535,6 +1670,15 @@ function TokenScreen({ token, portfolio, setPortfolio, onBack, watched, onToggle
             >
               Sell {sellPct ? `${sellPct}%` : ""} {token.symbol}
             </button>
+            ) : (
+              <button
+                onClick={() => placeLimitSell(sellPct, limitPrice)}
+                disabled={!sellPct || !holding || !limitPrice || parseFloat(limitPrice) <= 0}
+                style={{ ...actionBtn, background: C.amber, opacity: (!sellPct || !holding || !limitPrice || parseFloat(limitPrice) <= 0) ? 0.4 : 1 }}
+              >
+                Place Limit Sell
+              </button>
+            )}
           </>
         )}
       </div>
@@ -1567,7 +1711,8 @@ const actionBtn = {
 /* ============================================================
    PORTFOLIO SCREEN
 ============================================================ */
-function PortfolioScreen({ portfolio, tokenMap, solPrice, onOpenToken }) {
+function PortfolioScreen({ portfolio, setPortfolio, tokenMap, solPrice, onOpenToken }) {
+  const [tab, setTab] = useState("overview");
   const holdingsArr = Object.values(portfolio.holdings);
   let posValueUsd = 0;
   const rows = holdingsArr.map((h) => {
@@ -1594,6 +1739,24 @@ function PortfolioScreen({ portfolio, tokenMap, solPrice, onOpenToken }) {
   const avgPnlPerTrade = closedTrades.length
     ? closedTrades.reduce((s, t) => s + (t.realizedUsd || 0), 0) / closedTrades.length
     : null;
+
+  const pendingOrders = portfolio.orders.filter((o) => o.status === "pending");
+  const pastOrders = portfolio.orders.filter((o) => o.status !== "pending").slice(0, 20);
+
+  function cancelOrder(id) {
+    setPortfolio((p) => ({ ...p, orders: p.orders.map((o) => (o.id === id ? { ...o, status: "cancelled" } : o)) }));
+  }
+
+  const cardStyle = {
+    background: `linear-gradient(155deg, ${C.panel}, ${C.panel2})`, border: `1px solid ${C.borderSoft}`,
+    boxShadow: "0 1px 0 rgba(255,255,255,0.025) inset, 0 6px 16px rgba(0,0,0,0.18)", borderRadius: 14, overflow: "hidden",
+  };
+  const PORT_TABS = [
+    { id: "overview", label: "Overview" },
+    { id: "positions", label: `Positions${rows.length ? ` (${rows.length})` : ""}` },
+    { id: "orders", label: `Orders${pendingOrders.length ? ` (${pendingOrders.length})` : ""}` },
+    { id: "history", label: "History" },
+  ];
 
   return (
     <div style={{ padding: "14px 14px 90px" }}>
@@ -1624,87 +1787,152 @@ function PortfolioScreen({ portfolio, tokenMap, solPrice, onOpenToken }) {
         </div>
       </div>
 
-      <div style={{ fontSize: 11, fontWeight: 700, color: C.amber, margin: "4px 0 8px", textTransform: "uppercase", letterSpacing: 0.8 }}>Trading analytics</div>
-      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginBottom: 18 }}>
-        {[
-          ["Unrealized PnL", `${totalUnrealizedPnl >= 0 ? "+" : ""}$${totalUnrealizedPnl.toFixed(2)}`, totalUnrealizedPnl >= 0],
-          ["Total Trades", String(portfolio.trades.length), null],
-          ["Avg PnL / Trade", avgPnlPerTrade === null ? "—" : `${avgPnlPerTrade >= 0 ? "+" : ""}$${avgPnlPerTrade.toFixed(2)}`, avgPnlPerTrade === null ? null : avgPnlPerTrade >= 0],
-          ["Best Trade", bestTrade ? `+$${(bestTrade.realizedUsd || 0).toFixed(2)}` : "—", bestTrade ? true : null],
-          ["Worst Trade", worstTrade ? `${(worstTrade.realizedUsd || 0) >= 0 ? "+" : ""}$${(worstTrade.realizedUsd || 0).toFixed(2)}` : "—", worstTrade ? (worstTrade.realizedUsd || 0) >= 0 : null],
-          ["Open Positions", String(rows.length), null],
-        ].map(([label, val, positive]) => (
-          <div key={label} style={{ background: `linear-gradient(155deg, ${C.panel}, ${C.panel2})`, border: `1px solid ${C.borderSoft}`, boxShadow: "0 1px 0 rgba(255,255,255,0.025) inset, 0 6px 16px rgba(0,0,0,0.18)", borderRadius: 12, padding: "10px 12px" }}>
-            <div style={{ fontSize: 11, color: C.faint }}>{label}</div>
-            <div
-              style={{
-                fontFamily: "'JetBrains Mono', monospace", fontWeight: 600, fontSize: 14.5, marginTop: 2,
-                color: positive === null ? C.text : positive ? C.buy : C.sell,
-              }}
-            >
-              {val}
-            </div>
-          </div>
+      <div style={{ display: "flex", gap: 6, marginBottom: 14, overflowX: "auto" }}>
+        {PORT_TABS.map((pt) => (
+          <button
+            key={pt.id}
+            onClick={() => setTab(pt.id)}
+            style={{
+              flexShrink: 0, fontSize: 12.5, fontWeight: 600, padding: "7px 13px", borderRadius: 20,
+              border: `1px solid ${tab === pt.id ? C.amber : C.border}`,
+              background: tab === pt.id ? C.amberDim : "transparent",
+              color: tab === pt.id ? C.amber : C.sub, cursor: "pointer",
+            }}
+          >
+            {pt.label}
+          </button>
         ))}
       </div>
 
-      <div style={{ fontSize: 11, fontWeight: 700, color: C.amber, margin: "4px 0 8px", textTransform: "uppercase", letterSpacing: 0.8 }}>Open positions</div>
-      <div style={{ background: `linear-gradient(155deg, ${C.panel}, ${C.panel2})`, border: `1px solid ${C.borderSoft}`, boxShadow: "0 1px 0 rgba(255,255,255,0.025) inset, 0 6px 16px rgba(0,0,0,0.18)", borderRadius: 14, overflow: "hidden", marginBottom: 18 }}>
-        {rows.length === 0 ? (
-          <EmptyState icon={Wallet} title="No open positions" sub="Paper-buy a token from Discover to see it here." />
-        ) : (
-          rows.map((r) => (
-            <div
-              key={r.address}
-              onClick={() => r.live && onOpenToken(r.live)}
-              style={{ display: "flex", alignItems: "center", padding: "12px 14px", borderBottom: `1px solid ${C.borderSoft}`, cursor: r.live ? "pointer" : "default" }}
-            >
-              <Avatar t={r.live || r} size={32} radius={9} fontSize={12} />
-              <div style={{ flex: 1, marginLeft: 10 }}>
-                <div style={{ fontWeight: 700, fontSize: 14 }}>{r.symbol}</div>
-                <div style={{ fontSize: 11.5, color: C.faint, fontFamily: "'JetBrains Mono', monospace" }}>{fmtUsd(r.amount)} tokens · avg ${fmtPrice(r.avgEntry)}</div>
-              </div>
-              <div style={{ textAlign: "right" }}>
-                <div style={{ fontFamily: "'JetBrains Mono', monospace", fontWeight: 600, fontSize: 13.5 }}>${r.value.toFixed(2)}</div>
-                <Pill positive={r.upnl >= 0}>{r.upnl >= 0 ? "+" : ""}${r.upnl.toFixed(2)}</Pill>
+      {tab === "overview" && (
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+          {[
+            ["Unrealized PnL", `${totalUnrealizedPnl >= 0 ? "+" : ""}$${totalUnrealizedPnl.toFixed(2)}`, totalUnrealizedPnl >= 0],
+            ["Total Trades", String(portfolio.trades.length), null],
+            ["Avg PnL / Trade", avgPnlPerTrade === null ? "—" : `${avgPnlPerTrade >= 0 ? "+" : ""}$${avgPnlPerTrade.toFixed(2)}`, avgPnlPerTrade === null ? null : avgPnlPerTrade >= 0],
+            ["Best Trade", bestTrade ? `+$${(bestTrade.realizedUsd || 0).toFixed(2)}` : "—", bestTrade ? true : null],
+            ["Worst Trade", worstTrade ? `${(worstTrade.realizedUsd || 0) >= 0 ? "+" : ""}$${(worstTrade.realizedUsd || 0).toFixed(2)}` : "—", worstTrade ? (worstTrade.realizedUsd || 0) >= 0 : null],
+            ["Open Positions", String(rows.length), null],
+          ].map(([label, val, positive]) => (
+            <div key={label} style={{ background: `linear-gradient(155deg, ${C.panel}, ${C.panel2})`, border: `1px solid ${C.borderSoft}`, boxShadow: "0 1px 0 rgba(255,255,255,0.025) inset, 0 6px 16px rgba(0,0,0,0.18)", borderRadius: 12, padding: "10px 12px" }}>
+              <div style={{ fontSize: 11, color: C.faint }}>{label}</div>
+              <div style={{ fontFamily: "'JetBrains Mono', monospace", fontWeight: 600, fontSize: 14.5, marginTop: 2, color: positive === null ? C.text : positive ? C.buy : C.sell }}>
+                {val}
               </div>
             </div>
-          ))
-        )}
-      </div>
+          ))}
+        </div>
+      )}
 
-      <div style={{ fontSize: 11, fontWeight: 700, color: C.amber, margin: "4px 0 8px", textTransform: "uppercase", letterSpacing: 0.8 }}>Trade history</div>
-      <div style={{ background: `linear-gradient(155deg, ${C.panel}, ${C.panel2})`, border: `1px solid ${C.borderSoft}`, boxShadow: "0 1px 0 rgba(255,255,255,0.025) inset, 0 6px 16px rgba(0,0,0,0.18)", borderRadius: 14, overflow: "hidden" }}>
-        {portfolio.trades.length === 0 ? (
-          <EmptyState icon={Clock} title="No trades yet" sub="Your buy and sell history will show up here." />
-        ) : (
-          portfolio.trades.slice(0, 30).map((t) => (
-            <div key={t.id} style={{ display: "flex", alignItems: "center", padding: "11px 14px", borderBottom: `1px solid ${C.borderSoft}` }}>
-              <Avatar t={tokenMap[t.address] || { symbol: t.symbol }} size={26} radius={7} fontSize={9.5} />
-              {t.type === "buy" ? <ArrowUpRight size={13} color={C.buy} style={{ marginLeft: 6, flexShrink: 0 }} /> : <ArrowDownRight size={13} color={C.sell} style={{ marginLeft: 6, flexShrink: 0 }} />}
-              <div style={{ flex: 1, marginLeft: 10 }}>
-                <div style={{ fontSize: 13.5, fontWeight: 600 }}>
-                  {t.type === "buy" ? "Bought" : "Sold"} {t.symbol}
-                  {t.auto && (
-                    <span style={{ marginLeft: 6, fontSize: 9.5, fontWeight: 700, color: t.auto === "tp" ? C.buy : C.sell, background: t.auto === "tp" ? C.buyDim : C.sellDim, borderRadius: 5, padding: "2px 5px" }}>
-                      AUTO {t.auto.toUpperCase()}
-                    </span>
+      {tab === "positions" && (
+        <div style={cardStyle}>
+          {rows.length === 0 ? (
+            <EmptyState icon={Wallet} title="No open positions" sub="Paper-buy a token from Discover to see it here." />
+          ) : (
+            rows.map((r) => (
+              <div
+                key={r.address}
+                onClick={() => r.live && onOpenToken(r.live)}
+                style={{ display: "flex", alignItems: "center", padding: "12px 14px", borderBottom: `1px solid ${C.borderSoft}`, cursor: r.live ? "pointer" : "default" }}
+              >
+                <Avatar t={r.live || r} size={32} radius={9} fontSize={12} />
+                <div style={{ flex: 1, marginLeft: 10 }}>
+                  <div style={{ fontWeight: 700, fontSize: 14 }}>{r.symbol}</div>
+                  <div style={{ fontSize: 11.5, color: C.faint, fontFamily: "'JetBrains Mono', monospace" }}>
+                    {fmtUsd(r.amount)} tokens · avg ${fmtPrice(r.avgEntry)}
+                    {(r.tpPct || r.slPct) && (
+                      <span style={{ marginLeft: 6 }}>
+                        · {r.tpPct ? <span style={{ color: C.buy }}>+{r.tpPct}%TP</span> : null}
+                        {r.tpPct && r.slPct ? "/" : ""}
+                        {r.slPct ? <span style={{ color: C.sell }}>-{r.slPct}%SL</span> : null}
+                      </span>
+                    )}
+                  </div>
+                </div>
+                <div style={{ textAlign: "right" }}>
+                  <div style={{ fontFamily: "'JetBrains Mono', monospace", fontWeight: 600, fontSize: 13.5 }}>${r.value.toFixed(2)}</div>
+                  <Pill positive={r.upnl >= 0}>{r.upnl >= 0 ? "+" : ""}${r.upnl.toFixed(2)}</Pill>
+                </div>
+              </div>
+            ))
+          )}
+        </div>
+      )}
+
+      {tab === "orders" && (
+        <div style={cardStyle}>
+          {pendingOrders.length === 0 && pastOrders.length === 0 ? (
+            <EmptyState icon={Clock} title="No orders" sub="Place a limit order from any token page to see it here." />
+          ) : (
+            <>
+              {pendingOrders.map((o) => (
+                <div key={o.id} style={{ display: "flex", alignItems: "center", padding: "12px 14px", borderBottom: `1px solid ${C.borderSoft}` }}>
+                  <div style={{ flex: 1 }}>
+                    <div style={{ fontWeight: 700, fontSize: 14 }}>
+                      {o.type === "buy" ? <span style={{ color: C.buy }}>Buy</span> : <span style={{ color: C.sell }}>Sell</span>} {o.symbol}
+                    </div>
+                    <div style={{ fontSize: 11.5, color: C.faint, fontFamily: "'JetBrains Mono', monospace" }}>
+                      Trigger ${fmtPrice(o.targetPrice)} {o.type === "buy" ? `· ${fmtSol(o.solAmount)} SOL` : `· ${o.pct}%`}
+                    </div>
+                  </div>
+                  <span style={{ fontSize: 10.5, fontWeight: 700, color: C.amber, background: C.amberDim, borderRadius: 6, padding: "3px 7px", marginRight: 10 }}>PENDING</span>
+                  <X size={16} color={C.faint} style={{ cursor: "pointer" }} onClick={() => cancelOrder(o.id)} />
+                </div>
+              ))}
+              {pastOrders.map((o) => (
+                <div key={o.id} style={{ display: "flex", alignItems: "center", padding: "12px 14px", borderBottom: `1px solid ${C.borderSoft}`, opacity: 0.6 }}>
+                  <div style={{ flex: 1 }}>
+                    <div style={{ fontWeight: 600, fontSize: 13.5 }}>
+                      {o.type === "buy" ? "Buy" : "Sell"} {o.symbol}
+                    </div>
+                    <div style={{ fontSize: 11, color: C.faint, fontFamily: "'JetBrains Mono', monospace" }}>Trigger ${fmtPrice(o.targetPrice)}</div>
+                  </div>
+                  <span style={{ fontSize: 10.5, fontWeight: 700, color: C.faint, textTransform: "uppercase" }}>{o.status}</span>
+                </div>
+              ))}
+            </>
+          )}
+        </div>
+      )}
+
+      {tab === "history" && (
+        <div style={cardStyle}>
+          {portfolio.trades.length === 0 ? (
+            <EmptyState icon={Clock} title="No trades yet" sub="Your buy and sell history will show up here." />
+          ) : (
+            portfolio.trades.slice(0, 60).map((t) => (
+              <div key={t.id} style={{ display: "flex", alignItems: "center", padding: "11px 14px", borderBottom: `1px solid ${C.borderSoft}` }}>
+                <Avatar t={tokenMap[t.address] || { symbol: t.symbol }} size={26} radius={7} fontSize={9.5} />
+                {t.type === "buy" ? <ArrowUpRight size={13} color={C.buy} style={{ marginLeft: 6, flexShrink: 0 }} /> : <ArrowDownRight size={13} color={C.sell} style={{ marginLeft: 6, flexShrink: 0 }} />}
+                <div style={{ flex: 1, marginLeft: 10 }}>
+                  <div style={{ fontSize: 13.5, fontWeight: 600 }}>
+                    {t.type === "buy" ? "Bought" : "Sold"} {t.symbol}
+                    {t.auto && (
+                      <span style={{ marginLeft: 6, fontSize: 9.5, fontWeight: 700, color: t.auto === "tp" ? C.buy : C.sell, background: t.auto === "tp" ? C.buyDim : C.sellDim, borderRadius: 5, padding: "2px 5px" }}>
+                        AUTO {t.auto.toUpperCase()}
+                      </span>
+                    )}
+                    {t.fromOrder && (
+                      <span style={{ marginLeft: 6, fontSize: 9.5, fontWeight: 700, color: C.amber, background: C.amberDim, borderRadius: 5, padding: "2px 5px" }}>
+                        LIMIT
+                      </span>
+                    )}
+                  </div>
+                  <div style={{ fontSize: 11, color: C.faint }}>{new Date(t.time).toLocaleString()}</div>
+                </div>
+                <div style={{ textAlign: "right" }}>
+                  <div style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 13 }}>{fmtSol(t.solAmount)} SOL</div>
+                  {t.type === "sell" && (
+                    <div style={{ fontSize: 11, color: t.realizedUsd >= 0 ? C.buy : C.sell }}>
+                      {t.realizedUsd >= 0 ? "+" : ""}${t.realizedUsd.toFixed(2)}
+                    </div>
                   )}
                 </div>
-                <div style={{ fontSize: 11, color: C.faint }}>{new Date(t.time).toLocaleString()}</div>
               </div>
-              <div style={{ textAlign: "right" }}>
-                <div style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 13 }}>{fmtSol(t.solAmount)} SOL</div>
-                {t.type === "sell" && (
-                  <div style={{ fontSize: 11, color: t.realizedUsd >= 0 ? C.buy : C.sell }}>
-                    {t.realizedUsd >= 0 ? "+" : ""}${t.realizedUsd.toFixed(2)}
-                  </div>
-                )}
-              </div>
-            </div>
-          ))
-        )}
-      </div>
+            ))
+          )}
+        </div>
+      )}
     </div>
   );
 }
@@ -1987,6 +2215,7 @@ export default function App() {
     setPortfolio((p) => {
       const nextHoldings = { ...p.holdings };
       const newTrades = [];
+      const newNotifications = [];
       let realizedDelta = 0;
       let balanceDelta = 0;
       for (const { address, reason, price } of toClose) {
@@ -2002,6 +2231,11 @@ export default function App() {
           id: uid(), type: "sell", symbol: h.symbol, address, solAmount: solReceived,
           priceUsd: price, tokenAmount: h.amount, realizedUsd: realized, time: Date.now(), auto: reason,
         });
+        newNotifications.push({
+          id: uid(), kind: "auto",
+          message: `${reason === "tp" ? "Take-profit" : "Stop-loss"} hit: ${h.symbol} sold at $${fmtPrice(price)} (${realized >= 0 ? "+" : ""}$${realized.toFixed(2)})`,
+          time: Date.now(), read: false,
+        });
       }
       return {
         ...p,
@@ -2009,7 +2243,77 @@ export default function App() {
         balance: +(p.balance + balanceDelta).toFixed(6),
         realizedPnl: p.realizedPnl + realizedDelta,
         trades: [...newTrades, ...p.trades],
+        notifications: [...newNotifications, ...p.notifications],
       };
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tokens]);
+
+  // Limit-order fill engine: runs whenever prices refresh. A pending buy
+  // fills once price drops to/below its target; a pending sell fills once
+  // price rises to/above its target. Executes exactly like a manual trade.
+  useEffect(() => {
+    if (!portfolio || !portfolio.orders || portfolio.orders.length === 0) return;
+    if (!portfolio.orders.some((o) => o.status === "pending")) return;
+    setPortfolio((p) => {
+      let bal = p.balance;
+      let holdings = { ...p.holdings };
+      let trades = p.trades;
+      let realizedPnl = p.realizedPnl;
+      let notifications = p.notifications;
+      let changed = false;
+      const orders = p.orders.map((o) => {
+        if (o.status !== "pending") return o;
+        const live = tokenMap[o.address];
+        if (!live) return o;
+        const price = live.priceUsd;
+        if (o.type === "buy" && price <= o.targetPrice) {
+          if (o.solAmount > bal) return o; // can't afford yet, stays pending
+          const usdSpent = o.solAmount * solPrice;
+          const tokensBought = usdSpent / price;
+          const h = holdings[o.address];
+          const newAmount = (h?.amount || 0) + tokensBought;
+          const newCost = (h ? h.amount * h.avgEntry : 0) + usdSpent;
+          holdings[o.address] = { symbol: o.symbol, name: o.name, address: o.address, amount: newAmount, avgEntry: newCost / newAmount };
+          bal = +(bal - o.solAmount).toFixed(6);
+          trades = [
+            { id: uid(), type: "buy", symbol: o.symbol, address: o.address, solAmount: o.solAmount, priceUsd: price, tokenAmount: tokensBought, time: Date.now(), fromOrder: true },
+            ...trades,
+          ];
+          notifications = [
+            { id: uid(), kind: "order", message: `Limit buy filled: ${o.symbol} at $${fmtPrice(price)}`, time: Date.now(), read: false },
+            ...notifications,
+          ];
+          changed = true;
+          return { ...o, status: "filled", filledAt: Date.now() };
+        }
+        if (o.type === "sell" && price >= o.targetPrice) {
+          const h = holdings[o.address];
+          if (!h || h.amount <= 0) return { ...o, status: "cancelled" };
+          const tokensToSell = h.amount * (o.pct / 100);
+          const usdReceived = tokensToSell * price;
+          const solReceived = usdReceived / solPrice;
+          const realized = usdReceived - tokensToSell * h.avgEntry;
+          const remaining = h.amount - tokensToSell;
+          if (remaining <= 0.000001) delete holdings[o.address];
+          else holdings[o.address] = { ...h, amount: remaining };
+          bal = +(bal + solReceived).toFixed(6);
+          realizedPnl += realized;
+          trades = [
+            { id: uid(), type: "sell", symbol: o.symbol, address: o.address, solAmount: solReceived, priceUsd: price, tokenAmount: tokensToSell, realizedUsd: realized, time: Date.now(), fromOrder: true },
+            ...trades,
+          ];
+          notifications = [
+            { id: uid(), kind: "order", message: `Limit sell filled: ${o.symbol} at $${fmtPrice(price)} (${realized >= 0 ? "+" : ""}$${realized.toFixed(2)})`, time: Date.now(), read: false },
+            ...notifications,
+          ];
+          changed = true;
+          return { ...o, status: "filled", filledAt: Date.now() };
+        }
+        return o;
+      });
+      if (!changed) return p;
+      return { ...p, balance: bal, holdings, trades, realizedPnl, orders, notifications };
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tokens]);
@@ -2112,7 +2416,7 @@ export default function App() {
               )}
               {tab === "wallets" && <WalletsScreen />}
               {tab === "portfolio" && (
-                <PortfolioScreen portfolio={portfolio} tokenMap={tokenMap} solPrice={solPrice} onOpenToken={setSelected} />
+                <PortfolioScreen portfolio={portfolio} setPortfolio={setPortfolio} tokenMap={tokenMap} solPrice={solPrice} onOpenToken={setSelected} />
               )}
               {tab === "learn" && (
                 <LearnScreen
@@ -2146,8 +2450,18 @@ export default function App() {
                 borderRight: `1px solid ${C.border}`, padding: "20px 12px",
               }}
             >
-              <div style={{ fontWeight: 800, fontSize: 16, padding: "0 10px 20px", letterSpacing: -0.3 }}>
-                <span style={{ color: C.amber }}>●</span> Paper Trader
+              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "0 10px 14px" }}>
+                <div style={{ fontWeight: 800, fontSize: 16, letterSpacing: -0.3 }}>
+                  <span style={{ color: C.amber }}>●</span> Paper Trader
+                </div>
+                <NotificationBell portfolio={portfolio} setPortfolio={setPortfolio} />
+              </div>
+              <div style={{ padding: "0 10px 18px", borderBottom: `1px solid ${C.borderSoft}`, marginBottom: 8 }}>
+                <div style={{ fontSize: 10, color: C.faint, textTransform: "uppercase", letterSpacing: 0.6 }}>Balance</div>
+                <div style={{ fontFamily: "'JetBrains Mono', monospace", fontWeight: 700, fontSize: 15 }}>{fmtSol(portfolio.balance)} SOL</div>
+                <div style={{ fontSize: 11, marginTop: 2, color: portfolio.realizedPnl >= 0 ? C.buy : C.sell, fontFamily: "'JetBrains Mono', monospace" }}>
+                  {portfolio.realizedPnl >= 0 ? "+" : ""}${portfolio.realizedPnl.toFixed(2)} realized
+                </div>
               </div>
               {NAV.map((n) => {
                 const Icon = n.icon;
@@ -2191,6 +2505,12 @@ export default function App() {
                   </div>
                 );
               })}
+            </div>
+          )}
+
+          {!isDesktop && (
+            <div style={{ position: "fixed", top: 14, right: 14, zIndex: 250, background: C.panel2, border: `1px solid ${C.border}`, borderRadius: 99, padding: 8, boxShadow: "0 6px 18px rgba(0,0,0,.4)" }}>
+              <NotificationBell portfolio={portfolio} setPortfolio={setPortfolio} />
             </div>
           )}
         </>
